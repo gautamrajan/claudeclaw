@@ -23,7 +23,7 @@ const DEFAULT_SETTINGS: Settings = {
     modes: [
       {
         name: "planning",
-        model: "opus",
+        model: "deepseek/deepseek-v4-flash",
         keywords: [
           "plan", "design", "architect", "strategy", "approach",
           "research", "investigate", "analyze", "explore", "understand",
@@ -38,7 +38,7 @@ const DEFAULT_SETTINGS: Settings = {
       },
       {
         name: "implementation",
-        model: "sonnet",
+        model: "deepseek/deepseek-v4-flash",
         keywords: [
           "implement", "code", "write", "create", "build", "add",
           "fix", "debug", "refactor", "update", "modify", "change",
@@ -227,8 +227,8 @@ function parseAgenticConfig(raw: any): AgenticConfig {
 
   // Backward compat: old planningModel/implementationModel format
   if (!Array.isArray(raw.modes) && ("planningModel" in raw || "implementationModel" in raw)) {
-    const planningModel = typeof raw.planningModel === "string" ? raw.planningModel.trim() : "opus";
-    const implModel = typeof raw.implementationModel === "string" ? raw.implementationModel.trim() : "sonnet";
+    const planningModel = typeof raw.planningModel === "string" ? raw.planningModel.trim() : "deepseek/deepseek-v4-flash";
+    const implModel = typeof raw.implementationModel === "string" ? raw.implementationModel.trim() : "deepseek/deepseek-v4-flash";
     return {
       enabled,
       defaultMode: "implementation",
