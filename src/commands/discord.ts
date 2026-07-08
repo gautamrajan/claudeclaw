@@ -1,20 +1,14 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, agentDirKey } from "../runner";
-import { wrapUntrusted } from "../prompt-safety";
-import { isAllowed } from "../allowlist";
-import { extractErrorDetail } from "../messaging";
-import { loadPendingResume } from "../pending-resume";
-import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
-import { resetSession, resetFallbackSession, peekSession } from "../sessions";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { getSettings, loadSettings } from "../config";
+import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { findSessionJsonlPath } from "../sessionFiles";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
-import { extname, join, basename, sep } from "node:path";
-import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import { extname, join } from "node:path";
 
 // --- Discord API constants ---
 
@@ -59,12 +53,6 @@ interface DiscordAttachment {
   flags?: number;
 }
 
-interface DiscordMessageSnapshot {
-  content: string;
-  attachments: DiscordAttachment[];
-  author?: DiscordUser;
-}
-
 interface DiscordMessage {
   id: string;
   channel_id: string;
@@ -74,16 +62,8 @@ interface DiscordMessage {
   attachments: DiscordAttachment[];
   mentions: DiscordUser[];
   referenced_message?: DiscordMessage | null;
-  message_reference?: { type?: number };
-  message_snapshots?: [{ message: DiscordMessageSnapshot }];
   flags?: number;
   type: number;
-}
-
-const enum DiscordMessageType {
-  Default = 0,
-  Reply = 19,
-  ThreadCreated = 18,
 }
 
 interface DiscordInteraction {
@@ -137,24 +117,7 @@ let applicationId: string | null = null;
 let readyGuildIds: Set<string> | null = null;
 
 // Track known thread channel IDs and their parent channel IDs for multi-session support
-const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
-
-function isDiscordThreadType(type: number | undefined): boolean {
-  return type === 10 || type === 11 || type === 12;
-}
-
-// Upsert knownThreads, preserving any existing agentName when a new one is not supplied.
-// The agentName key is "<slug>-<threadId>" to guarantee uniqueness across threads whose
-// display names would otherwise map to the same slug.
-// Always use this instead of knownThreads.set() to avoid accidental data loss on recovery paths.
-function upsertThread(id: string, parentId: string, rawName?: string): void {
-  const existing = knownThreads.get(id);
-  let agentName: string | undefined;
-  if (rawName) {
-    try { agentName = agentDirKey(rawName, id); } catch { /* unsanitizable — no agent scoping */ }
-  }
-  knownThreads.set(id, { parentId, agentName: agentName ?? existing?.agentName });
-}
+const knownThreads = new Map<string, { parentId: string }>();
 
 // --- Debug ---
 
@@ -170,7 +133,6 @@ async function discordApi<T>(
   method: string,
   endpoint: string,
   body?: unknown,
-  attempt = 0,
 ): Promise<T> {
   const res = await fetch(`${DISCORD_API}${endpoint}`, {
     method,
@@ -183,16 +145,11 @@ async function discordApi<T>(
 
   // Rate limit handling
   if (res.status === 429) {
-    if (attempt >= 3) {
-      throw new Error(`Discord rate limit exceeded after 3 retries on ${method} ${endpoint}`);
-    }
-    const data = (await res.json().catch(() => ({}))) as { retry_after?: number };
-    const retryMs = typeof data.retry_after === "number" && isFinite(data.retry_after)
-      ? Math.ceil(data.retry_after * 1000)
-      : 5_000;
-    debugLog(`Rate limited on ${method} ${endpoint}, retrying in ${retryMs}ms (attempt ${attempt + 1}/3)`);
+    const data = (await res.json()) as { retry_after: number };
+    const retryMs = Math.ceil(data.retry_after * 1000);
+    debugLog(`Rate limited on ${method} ${endpoint}, retrying in ${retryMs}ms`);
     await Bun.sleep(retryMs);
-    return discordApi(token, method, endpoint, body, attempt + 1);
+    return discordApi(token, method, endpoint, body);
   }
 
   if (!res.ok) {
@@ -207,30 +164,20 @@ async function discordApi<T>(
 
 // --- Message sending ---
 
-const DISCORD_MAX_MESSAGE_LEN = 2000;
-
-function discordMessageChunks(text: string): string[] {
-  const normalized = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
-  if (!normalized) return [];
-  const chunks: string[] = [];
-  for (let i = 0; i < normalized.length; i += DISCORD_MAX_MESSAGE_LEN) {
-    chunks.push(normalized.slice(i, i + DISCORD_MAX_MESSAGE_LEN));
-  }
-  return chunks;
-}
-
 async function sendMessage(
   token: string,
   channelId: string,
   text: string,
   components?: unknown[],
 ): Promise<void> {
-  const chunks = discordMessageChunks(text);
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+  const normalized = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
+  if (!normalized) return;
+  const MAX_LEN = 2000;
+  for (let i = 0; i < normalized.length; i += MAX_LEN) {
+    const chunk = normalized.slice(i, i + MAX_LEN);
     const body: Record<string, unknown> = { content: chunk };
     // Attach components only to the last chunk
-    if (components && i === chunks.length - 1) {
+    if (components && i + MAX_LEN >= normalized.length) {
       body.components = components;
     }
     await discordApi(token, "POST", `/channels/${channelId}/messages`, body);
@@ -288,159 +235,25 @@ function extractReactionDirective(text: string): { cleanedText: string; reaction
   return { cleanedText, reactionEmoji };
 }
 
-// Matches absolute image file paths embedded in reply text so they can be
-// sent as Discord file attachments instead of appearing as raw paths.
-const IMAGE_PATH_RE = /(?<![^\s])(\/[^\s]+\.(?:png|jpe?g|gif|webp))(?=\s|$)/gi;
-const PATH_SKEW_MS = 30_000;
-
-function extractImagePaths(
-  text: string,
-  allowedRoots: string[],
-  requestStartedAt: number,
-): { paths: string[]; cleanedText: string } {
-  const roots = allowedRoots.length > 0 ? allowedRoots : [DEFAULT_IMAGE_OUTPUT_ROOT];
-  const canonRoots = roots.map((r) => {
-    try { return realpathSync(r); } catch { return r; }
-  });
-  const paths: string[] = [];
-  const cleanedText = text
-    .replace(IMAGE_PATH_RE, (match, p1) => {
-      let resolved: string;
-      try {
-        resolved = realpathSync(p1);
-      } catch {
-        return match;
-      }
-      const confined = canonRoots.some((root) => resolved === root || resolved.startsWith(root + sep));
-      if (!confined) return match;
-      try {
-        const { mtimeMs } = statSync(resolved);
-        if (mtimeMs < requestStartedAt - PATH_SKEW_MS) return match;
-      } catch {
-        return match;
-      }
-      paths.push(resolved);
-      return "";
-    })
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return { paths, cleanedText };
-}
-
-async function sendMessageWithImages(
-  token: string,
-  channelId: string,
-  text: string,
-  imagePaths: string[],
-): Promise<void> {
-  const chunks = discordMessageChunks(text || "​");
-  const uploadText = chunks.pop() ?? "​";
-  for (const chunk of chunks) {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: chunk });
-  }
-
-  await uploadImageMessage(token, channelId, uploadText, imagePaths);
-}
-
-async function uploadImageMessage(
-  token: string,
-  channelId: string,
-  text: string,
-  imagePaths: string[],
-  attempt = 0,
-): Promise<void> {
-  const form = new FormData();
-  form.append("payload_json", JSON.stringify({ content: text }));
-  for (let i = 0; i < imagePaths.length; i++) {
-    const file = Bun.file(imagePaths[i]);
-    form.append(`files[${i}]`, file, basename(imagePaths[i]));
-  }
-  const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
-    method: "POST",
-    headers: { Authorization: `Bot ${token}` },
-    body: form,
-  });
-  if (res.status === 429) {
-    if (attempt >= 3) {
-      throw new Error(`Discord rate limit exceeded after 3 retries on ${channelId}`);
-    }
-    const data = (await res.json().catch(() => ({}))) as { retry_after?: number };
-    const delay = typeof data.retry_after === "number" && isFinite(data.retry_after)
-      ? Math.ceil(data.retry_after * 1000)
-      : 5_000;
-    await Bun.sleep(delay);
-    return uploadImageMessage(token, channelId, text, imagePaths, attempt + 1);
-  }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Discord image upload ${channelId}: ${res.status} ${errText}`);
-  }
-}
-
 // --- Thread rejoin helper ---
-// trigger='RESUMED': skip all REST calls — session is intact, delivery should be live.
-// trigger='GUILD_CREATE': PUT-only for threads listed as member=yes; DELETE+PUT for others.
-async function rejoinThreads(
-  token: string,
-  trigger: "GUILD_CREATE" | "RESUMED",
-  memberThreadIds?: Set<string>,
-): Promise<void> {
+async function rejoinThreads(token: string): Promise<void> {
   const threadSessions = await listThreadSessions();
-  const sessionShort = gatewaySessionId?.slice(0, 8) ?? "?";
-  const infra = threadSessions.filter((ts) => /^\d{17,19}$/.test(ts.threadId));
-
-  if (trigger === "RESUMED") {
-    console.log(`[Discord][REJOIN] trigger=RESUMED threads=${infra.length} session=${sessionShort}`);
-    for (const ts of infra) {
-      console.log(`[Discord][REJOIN] thread=${ts.threadId} RESUMED=skip (session intact)`);
-    }
-    return;
-  }
-
-  // GUILD_CREATE path
-  console.log(
-    `[Discord][REJOIN] trigger=GUILD_CREATE sessions=${infra.length} session=${sessionShort}`,
-  );
-  let rejoinedCount = 0;
-  let skippedNonThreads = 0;
-
-  for (const ts of infra) {
-    const isMember = memberThreadIds?.has(ts.threadId) ?? false;
+  for (const ts of threadSessions) {
     try {
-      let threadInfo = knownThreads.get(ts.threadId);
-      if (!threadInfo) {
-        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(token, "GET", `/channels/${ts.threadId}`);
-        if (!isDiscordThreadType(ch.type)) {
-          skippedNonThreads += 1;
-          debugLog(`[Discord][REJOIN] skip non-thread session ${ts.threadId} type=${ch.type ?? "unknown"}`);
-          continue;
-        }
-        if (!ch.parent_id) {
-          skippedNonThreads += 1;
-          debugLog(`[Discord][REJOIN] skip thread session ${ts.threadId} without parent_id`);
-          continue;
-        }
-        upsertThread(ts.threadId, ch.parent_id, ch.name);
-        threadInfo = knownThreads.get(ts.threadId);
-      }
-      if (!threadInfo) continue;
-
-      if (!isMember) {
-        // Not in GUILD_CREATE member list — force full rejoin to reset gateway subscription
-        await discordApi(token, "DELETE", `/channels/${ts.threadId}/thread-members/@me`).catch(() => {});
-      }
       await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
-      rejoinedCount += 1;
-      console.log(
-        `[Discord][REJOIN] thread=${ts.threadId} GUILD_CREATE=${isMember ? "member" : "non-member"} rejoined`,
-      );
+      if (!knownThreads.has(ts.threadId)) {
+        const ch = await discordApi<{ parent_id?: string }>(token, "GET", `/channels/${ts.threadId}`);
+        if (ch.parent_id) {
+          knownThreads.set(ts.threadId, { parentId: ch.parent_id });
+        }
+      }
+      console.log(`[Discord] Rejoined thread: ${ts.threadId}`);
     } catch (err) {
       console.error(`[Discord] Failed to rejoin thread ${ts.threadId}: ${err}`);
     }
   }
-
-  if (infra.length > 0) {
-    console.log(`[Discord][REJOIN] done. rejoined=${rejoinedCount} skippedNonThreads=${skippedNonThreads} knownThreads size=${knownThreads.size}`);
+  if (threadSessions.length > 0) {
+    console.log(`[Discord] Rejoined ${threadSessions.length} thread(s) from sessions.json`);
   }
 }
 
@@ -451,7 +264,7 @@ function guildTriggerReason(message: DiscordMessage): string | null {
   if (botUserId && message.referenced_message?.author?.id === botUserId) return "reply_to_bot";
 
   // Mention via mentions array
-  if (botUserId && message.mentions?.some((m) => m.id === botUserId)) return "mention";
+  if (botUserId && message.mentions.some((m) => m.id === botUserId)) return "mention";
 
   // Mention in content (fallback)
   if (botUserId && message.content.includes(`<@${botUserId}>`)) return "mention_in_content";
@@ -459,9 +272,6 @@ function guildTriggerReason(message: DiscordMessage): string | null {
   // Listen channel (respond to all messages, no mention needed)
   const config = getSettings().discord;
   if (config.listenChannels.includes(message.channel_id)) return "listen_channel";
-
-  // Listen guild (respond to all messages in any channel/thread of this guild)
-  if (message.guild_id && config.listenGuilds.includes(message.guild_id)) return "listen_guild";
 
   // Thread whose parent channel is a listen channel
   const threadInfo = knownThreads.get(message.channel_id);
@@ -528,12 +338,6 @@ function isVoiceAttachment(a: DiscordAttachment): boolean {
   // IS_VOICE_MESSAGE flag
   if ((a.flags ?? 0) & (1 << 13)) return true;
   return Boolean(a.content_type?.startsWith("audio/"));
-}
-
-function isTextAttachment(a: DiscordAttachment): boolean {
-  if (a.content_type?.startsWith("text/")) return true;
-  const ext = extname(a.filename).toLowerCase();
-  return ext === ".txt" || ext === ".md";
 }
 
 async function downloadDiscordAttachment(
@@ -617,155 +421,29 @@ async function respondToInteraction(
   );
 }
 
-// --- Discord streaming callback ---
-
-const STREAM_EDIT_INTERVAL_MS = 1500;
-const STREAM_CONTENT_MAX = DISCORD_MAX_MESSAGE_LEN - 10; // room for italic markers
-
-function escapeItalic(text: string): string {
-  return text.replace(/_/g, "\\_");
-}
-
-interface DiscordStreamCallbacks {
-  onChunk: (text: string) => void;
-  onToolEvent: (line: string) => void;
-  finalize: () => Promise<void>;
-  waitForStreamMsg: () => Promise<{ msgId: string } | null>;
-}
-
-function makeDiscordStreamCallback(token: string, channelId: string): DiscordStreamCallbacks {
-  let accumulated = "";
-  let streamMsgId: string | null = null;
-  let editTimer: ReturnType<typeof setTimeout> | null = null;
-  let placeholderPosted = false;
-
-  // Resolvers for waitForStreamMsg
-  let streamMsgResolvers: Array<(v: { msgId: string } | null) => void> = [];
-  let streamMsgSettled = false;
-  let streamMsgResult: { msgId: string } | null = null;
-
-  function notifyStreamMsgWaiters(result: { msgId: string } | null): void {
-    streamMsgSettled = true;
-    streamMsgResult = result;
-    for (const resolve of streamMsgResolvers) resolve(result);
-    streamMsgResolvers = [];
-  }
-
-  async function postPlaceholder(): Promise<void> {
-    if (placeholderPosted) return;
-    placeholderPosted = true;
-    try {
-      const msg = await discordApi<{ id: string }>(
-        token,
-        "POST",
-        `/channels/${channelId}/messages`,
-        { content: "⏳" },
-      );
-      streamMsgId = msg.id;
-      notifyStreamMsgWaiters({ msgId: msg.id });
-    } catch (err) {
-      console.error(`[Discord][stream] Failed to post placeholder: ${err instanceof Error ? err.message : err}`);
-      notifyStreamMsgWaiters(null);
-    }
-  }
-
-  function scheduleEdit(): void {
-    if (editTimer) return;
-    editTimer = setTimeout(async () => {
-      editTimer = null;
-      if (!streamMsgId) return;
-      const snippet = accumulated.slice(-STREAM_CONTENT_MAX);
-      const escaped = escapeItalic(snippet);
-      const content = `_${escaped}_`;
-      try {
-        await discordApi(
-          token,
-          "PATCH",
-          `/channels/${channelId}/messages/${streamMsgId}`,
-          { content },
-        );
-      } catch (err) {
-        debugLog(`Stream edit failed: ${err instanceof Error ? err.message : err}`);
-      }
-    }, STREAM_EDIT_INTERVAL_MS);
-  }
-
-  const onChunk = (text: string): void => {
-    accumulated += text;
-    if (!placeholderPosted) {
-      postPlaceholder().catch((err) =>
-        console.error(`[Discord][stream] postPlaceholder error: ${err instanceof Error ? err.message : err}`),
-      );
-    }
-    if (streamMsgId) scheduleEdit();
-  };
-
-  const onToolEvent = (line: string): void => {
-    // Post the placeholder on the first tool event
-    if (!placeholderPosted) {
-      postPlaceholder().catch((err) =>
-        console.error(`[Discord][stream] postPlaceholder error: ${err instanceof Error ? err.message : err}`),
-      );
-    }
-    accumulated += (accumulated ? "\n" : "") + line;
-    if (streamMsgId) scheduleEdit();
-  };
-
-  const waitForStreamMsg = (): Promise<{ msgId: string } | null> => {
-    if (streamMsgSettled) return Promise.resolve(streamMsgResult);
-    return new Promise<{ msgId: string } | null>((resolve) => {
-      streamMsgResolvers.push(resolve);
-    });
-  };
-
-  const finalize = async (): Promise<void> => {
-    if (editTimer) { clearTimeout(editTimer); editTimer = null; }
-    // If no placeholder was ever triggered, nothing to clean up
-    if (!placeholderPosted) return;
-    // Wait for the in-flight POST to resolve (already done if streamMsgId is set)
-    const result = await waitForStreamMsg();
-    if (!result?.msgId) return;
-    try {
-      await discordApi(token, "DELETE", `/channels/${channelId}/messages/${result.msgId}`);
-    } catch (err) {
-      debugLog(`Stream finalize delete failed: ${err instanceof Error ? err.message : err}`);
-    }
-  };
-
-  return { onChunk, onToolEvent, finalize, waitForStreamMsg };
-}
-
 // --- Message handler ---
 
-// Pending forwards: when Discord delivers a forward with empty content, hold it briefly
-// so a follow-up text comment from the same user can absorb it as context.
-const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; timer: ReturnType<typeof setTimeout> }>();
-
-async function handleMessageCreate(token: string, message: DiscordMessage, skipCoalesce = false): Promise<void> {
+async function handleMessageCreate(token: string, message: DiscordMessage): Promise<void> {
   const config = getSettings().discord;
 
   // Ignore bot messages
   if (message.author.bot) return;
 
-  // Ignore system message types (thread creation recap, pins, etc.) — only process
-  // regular messages (0) and replies (19) to avoid spurious prompts on the parent channel.
-  if (message.type !== DiscordMessageType.Default && message.type !== DiscordMessageType.Reply) return;
-
   const userId = message.author.id;
   const channelId = message.channel_id;
   const isDM = !message.guild_id;
   const isGuild = !!message.guild_id;
-  const content = message.content.replace(/\0/g, "");
+  const content = message.content;
 
   // Recover lost thread from sessions.json (fallback for knownThreads volatility)
   if (isGuild && !knownThreads.has(channelId)) {
     const persisted = await peekThreadSession(channelId);
     if (persisted) {
       try {
-        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(config.token, "GET", `/channels/${channelId}`);
-        if (isDiscordThreadType(ch.type) && ch.parent_id) {
-          upsertThread(channelId, ch.parent_id, ch.name);
-          debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id} name: ${ch.name ?? "unknown"})`);
+        const ch = await discordApi<{ parent_id?: string }>(config.token, "GET", `/channels/${channelId}`);
+        if (ch.parent_id) {
+          knownThreads.set(channelId, { parentId: ch.parent_id });
+          debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id})`);
         }
       } catch (err) {
         debugLog(`Thread recovery failed for ${channelId}: ${err}`);
@@ -785,7 +463,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   );
 
   // Authorization check
-  if (!isAllowed(userId, config.allowedUserIds)) {
+  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
     if (isDM) {
       await sendMessage(config.token, channelId, "Unauthorized.");
     } else {
@@ -797,40 +475,10 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   // Detect attachments
   const imageAttachments = message.attachments.filter(isImageAttachment);
   const voiceAttachments = message.attachments.filter(isVoiceAttachment);
-  const textAttachments = message.attachments.filter(isTextAttachment);
   const hasImage = imageAttachments.length > 0;
   const hasVoice = voiceAttachments.length > 0;
-  const hasText = textAttachments.length > 0;
 
-  const hasForwardedContent = !!message.message_snapshots?.[0]?.message?.content;
-  if (!content.trim() && !hasImage && !hasVoice && !hasText && !hasForwardedContent) return;
-
-  const forwardKey = `${channelId}:${userId}`;
-  const isForwardOnly = message.message_reference?.type === 1 && !content.trim() && !hasImage && !hasVoice && !hasText;
-
-  if (!skipCoalesce && isForwardOnly && hasForwardedContent) {
-    // Pure forward with no accompanying text — hold it and wait for a follow-up comment
-    const existing = pendingForwards.get(forwardKey);
-    if (existing) clearTimeout(existing.timer);
-    const snapshot = message.message_snapshots![0].message;
-    const timer = setTimeout(() => {
-      pendingForwards.delete(forwardKey);
-      handleMessageCreate(token, message, true).catch((err) =>
-        console.error(`[Discord] Deferred forward error: ${err instanceof Error ? err.message : err}`)
-      );
-    }, 1500);
-    pendingForwards.set(forwardKey, { snapshot, timer });
-    return;
-  }
-
-  // If a pending forward exists for this user+channel, absorb it into this message as context
-  let coalescedSnapshot: DiscordMessageSnapshot | undefined;
-  const pending = pendingForwards.get(forwardKey);
-  if (pending && !isForwardOnly) {
-    clearTimeout(pending.timer);
-    pendingForwards.delete(forwardKey);
-    coalescedSnapshot = pending.snapshot;
-  }
+  if (!content.trim() && !hasImage && !hasVoice) return;
 
   // Strip bot mention from content for cleaner prompt
   let cleanContent = content;
@@ -839,26 +487,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   }
 
   const label = message.author.username;
-  const mediaParts = [hasImage ? "image" : "", hasVoice ? "voice" : "", hasText ? "text" : ""].filter(Boolean);
+  const mediaParts = [hasImage ? "image" : "", hasVoice ? "voice" : ""].filter(Boolean);
   const mediaSuffix = mediaParts.length > 0 ? ` [${mediaParts.join("+")}]` : "";
   console.log(
     `[${new Date().toLocaleTimeString()}] Discord ${label}${mediaSuffix}: "${cleanContent.slice(0, 60)}${cleanContent.length > 60 ? "..." : ""}"`,
   );
 
-  // Plugin wizard: intercept /plugin and /claudeclaw:plugin before thread management and Claude routing.
-  // Must run here — after auth + non-empty checks but before AI thread intent classification,
-  // so an active wizard cannot be bypassed by messages that classify as "hire" / "fire".
-  const threadInfo = knownThreads.get(channelId);
-  const wizardCtx = { iface: "discord" as const, scopeId: channelId, agentName: threadInfo?.agentName };
-  if ((cleanContent.trim().startsWith("/") && isWizardTrigger(cleanContent.trim().split(/\s+/, 1)[0].toLowerCase())) || hasActiveWizard(wizardCtx)) {
-    const reply = await handleWizardInput(wizardCtx, cleanContent.trim());
-    await sendMessage(config.token, channelId, reply);
-    return;
-  }
-
   // Typing indicator loop (Discord typing lasts 10s, fire every 8s)
   const typingInterval = setInterval(() => sendTyping(config.token, channelId), 8000);
-  let streamCb: DiscordStreamCallbacks | undefined;
 
   try {
     await sendTyping(config.token, channelId);
@@ -866,7 +502,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     let imagePath: string | null = null;
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
-    let textContent: string | null = null;
 
     if (hasImage) {
       try {
@@ -896,18 +531,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       }
     }
 
-    if (hasText) {
-      try {
-        const resp = await fetch(textAttachments[0].url);
-        if (resp.ok) {
-          const raw = await resp.text();
-          textContent = raw.length > 2048 ? raw.slice(0, 2048) + "\n...[truncated]" : raw;
-        }
-      } catch (err) {
-        console.error(`[Discord] Failed to fetch text attachment for ${label}: ${err instanceof Error ? err.message : err}`);
-      }
-    }
-
     // --- Thread management: AI-powered intent classification ---
     if (isGuild && cleanContent.length < 200) {
       const intent = await classifyThreadIntent(cleanContent);
@@ -925,7 +548,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
                 auto_archive_duration: 4320, // 3 days
               },
             );
-            upsertThread(thread.id, channelId, threadName);
+            knownThreads.set(thread.id, { parentId: channelId });
             // Don't pre-create session — let Claude CLI create it on first message
             // The real UUID will be captured and saved by runner.ts
             await sendMessage(config.token, thread.id, `🧵 Thread **${threadName}** created with independent session. Start chatting!`);
@@ -975,7 +598,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
 
     // Skill routing: detect slash commands and resolve to SKILL.md prompts
     const command = cleanContent.startsWith("/") ? cleanContent.trim().split(/\s+/, 1)[0].toLowerCase() : null;
-
     let skillContext: string | null = null;
     if (command) {
       try {
@@ -989,16 +611,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     }
 
     // Build prompt (same pattern as Telegram)
-    const channelName = config.channelNames?.[channelId] ?? channelId;
-    const channelTag = isGuild ? `[Discord Channel: ${channelName}]` : `[Discord DM]`;
-    const promptParts = [channelTag, `[Discord from ${label}]`];
+    const promptParts = [`[Discord from ${label}]`];
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
       promptParts.push(skillContext);
-      if (args) promptParts.push(`User arguments: ${wrapUntrusted("skill-arguments", args)}`);
+      if (args) promptParts.push(`User arguments: ${args}`);
     } else if (cleanContent.trim()) {
-      promptParts.push(`Message: ${wrapUntrusted("user-message", cleanContent)}`);
+      promptParts.push(`Message: ${cleanContent}`);
     }
     if (imagePath) {
       promptParts.push(`Image path: ${imagePath}`);
@@ -1007,75 +627,21 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       promptParts.push("The user attached an image, but downloading it failed. Respond and ask them to resend.");
     }
     if (voiceTranscript) {
-      promptParts.push(`Voice transcript: ${wrapUntrusted("voice-transcript", voiceTranscript, 2000)}`);
+      promptParts.push(`Voice transcript: ${voiceTranscript}`);
       promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
     } else if (hasVoice) {
       promptParts.push(
         "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip.",
       );
     }
-    if (textContent) {
-      promptParts.push(`Attached text file (${textAttachments[0].filename}):\n${wrapUntrusted("user-attachment", textContent, 2000)}`);
-    } else if (hasText) {
-      promptParts.push("The user attached a text file, but downloading it failed. Ask them to resend.");
-    }
-
-    // Include context from replied-to or forwarded messages
-    const isForward = message.message_reference?.type === 1;
-    const snapshot = coalescedSnapshot ?? message.message_snapshots?.[0]?.message;
-    if ((isForward || coalescedSnapshot) && snapshot) {
-      const fwdAuthor = snapshot.author ? snapshot.author.username : "unknown";
-      const fwdAttachments = snapshot.attachments.length > 0
-        ? ` [attachments: ${snapshot.attachments.map((a) => a.filename).join(", ")}]`
-        : "";
-      promptParts.push(`[Forwarded message from ${fwdAuthor}]: ${snapshot.content}${fwdAttachments}`);
-    } else if (message.referenced_message) {
-      const ref = message.referenced_message;
-      const refAuthor = ref.author.username;
-      const refAttachments = ref.attachments.length > 0
-        ? ` [attachments: ${ref.attachments.map((a) => a.filename).join(", ")}]`
-        : "";
-      promptParts.push(`[In reply to ${refAuthor}]: ${ref.content}${refAttachments}`);
-    }
 
     const prefixedPrompt = promptParts.join("\n");
-    // Guild channels (including threads) each get their own isolated session; DMs use the global session
-    const sessionKey = isGuild ? channelId : undefined;
-    const requestStartedAt = Date.now();
-    if (sessionKey) {
-      const existing = await peekThreadSession(sessionKey);
-      const globalSession = await peekSession();
-      if (!existing && globalSession) {
-        console.warn(
-          `[Discord] Channel ${channelId} now using isolated session. ` +
-            `Global session history is no longer accessible here.`,
-        );
-      }
-    }
-    if (config.streaming) {
-      streamCb = makeDiscordStreamCallback(config.token, channelId);
-    }
-
-    const result = await (async () => {
-      try {
-        return await runUserMessage(
-          "discord",
-          prefixedPrompt,
-          sessionKey,
-          threadInfo?.agentName,
-          streamCb?.onChunk,
-          streamCb?.onToolEvent,
-        );
-      } finally {
-        if (streamCb) {
-          await streamCb.finalize();
-          streamCb = undefined;
-        }
-      }
-    })();
+    // Use thread-specific session if message is in a known thread
+    const threadId = knownThreads.has(channelId) ? channelId : undefined;
+    const result = await runUserMessage("discord", prefixedPrompt, threadId);
 
     if (result.exitCode !== 0) {
-      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`);
+      await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
     } else {
       const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
       if (reactionEmoji) {
@@ -1083,11 +649,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
           console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      const { paths: imagePaths, cleanedText: finalText } = extractImagePaths(cleanedText || "", config.imageOutputRoots, requestStartedAt);
-      if (imagePaths.length > 0) {
-        await sendMessageWithImages(config.token, channelId, finalText || "(empty response)", imagePaths);
-      } else {
-        await sendMessage(config.token, channelId, finalText || "(empty response)");
+      if (!cleanedText.trim().startsWith("HEARTBEAT_OK")) {
+        await sendMessage(config.token, channelId, cleanedText || "(empty response)");
       }
     }
   } catch (err) {
@@ -1095,9 +658,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     console.error(`[Discord] Error for ${label}: ${errMsg}`);
     await sendMessage(config.token, channelId, `Error: ${errMsg}`);
   } finally {
-    if (streamCb) {
-      await streamCb.finalize();
-    }
     clearInterval(typingInterval);
   }
 }
@@ -1108,7 +668,7 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
   const config = getSettings().discord;
   const actorId = interaction.member?.user?.id ?? interaction.user?.id;
 
-  if (!isAllowed(actorId, config.allowedUserIds)) {
+  if (config.allowedUserIds.length > 0 && (!actorId || !config.allowedUserIds.includes(actorId))) {
     await respondToInteraction(interaction, { content: "Unauthorized.", flags: 64 });
     return;
   }
@@ -1123,28 +683,16 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "reset") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      if (isGuildCmd) {
-        await removeThreadSession(interaction.channel_id!);
-        await resetFallbackSession(undefined, interaction.channel_id!);
-      } else {
-        await resetSession();
-        await resetFallbackSession();
-      }
+      await resetSession();
       await respondToInteraction(interaction, {
-        content: isGuildCmd ? "Channel session reset. Next message starts fresh." : "Global session reset. Next message starts fresh.",
+        content: "Global session reset. Next message starts fresh.",
       });
       return;
     }
 
     if (interaction.data.name === "compact") {
       await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
-      const compactChannelId = interaction.channel_id;
-      const compactThreadInfo = compactChannelId ? knownThreads.get(compactChannelId) : undefined;
-      const isGuildCmd = !!interaction.guild_id && !!compactChannelId;
-      const result = isGuildCmd
-        ? await compactCurrentThreadSession(compactChannelId!, compactThreadInfo?.agentName)
-        : await compactCurrentSession();
+      const result = await compactCurrentSession();
       await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
         {
@@ -1157,10 +705,7 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "status") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const session = await peekSession();
       const settings = getSettings();
       if (!session) {
         await respondToInteraction(interaction, { content: "📊 No active session." });
@@ -1191,16 +736,15 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "context") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const session = await peekSession();
       if (!session) {
         await respondToInteraction(interaction, { content: "No active session." });
         return;
       }
-      const jsonlPath = findSessionJsonlPath(session.sessionId);
-      if (!jsonlPath) {
+      const home = homedir();
+      const projectSlug = process.cwd().replace(/\//g, "-");
+      const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
+      if (!existsSync(jsonlPath)) {
         await respondToInteraction(interaction, { content: "Conversation file not found." });
         return;
       }
@@ -1302,12 +846,6 @@ async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<vo
   // Skip guilds we were already in at READY time
   if (readyGuildIds?.has(guild.id)) return;
 
-  // Only post a welcome message if the guild is in the allowedGuilds list
-  if (config.allowedGuilds.length === 0 || !config.allowedGuilds.includes(guild.id)) {
-    console.log(`[Discord] Joined guild ${guild.id} (${guild.name}) but not in allowedGuilds; staying quiet.`);
-    return;
-  }
-
   const channelId = guild.system_channel_id;
   if (!channelId) return;
 
@@ -1315,7 +853,7 @@ async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<vo
 
   const eventPrompt =
     `[Discord system event] I was added to a guild.\n` +
-    `Guild name: ${wrapUntrusted("guild-name", guild.name)}\n` +
+    `Guild name: ${guild.name}\n` +
     `Guild id: ${guild.id}\n` +
     "Write a short first message for the server. Confirm I was added and explain how to trigger me (mention or reply).";
 
@@ -1410,23 +948,6 @@ function sendResume(token: string): void {
 // Non-recoverable close codes that should not trigger reconnection
 const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
-async function runPendingResume(token: string): Promise<void> {
-  const resume = await loadPendingResume("discord");
-  if (!resume) return;
-  console.log(`[Discord] Running pending resume for channel ${resume.channelId}`);
-  const result = await runUserMessage("discord", resume.wakeUpPrompt, resume.sessionKey, resume.agentName);
-  if (result.exitCode !== 0) {
-    console.error(`[Discord] Pending resume failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`);
-    return;
-  }
-  const output = result.stdout?.trim();
-  if (output) {
-    // Discord threads are channels — post to thread ID when present, else channel
-    const targetChannel = resume.threadId ?? resume.channelId;
-    await sendMessage(token, targetChannel, output);
-  }
-}
-
 function handleDispatch(token: string, eventName: string, data: any): void {
   debugLog(`Dispatch: ${eventName}`);
 
@@ -1443,14 +964,11 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       registerSlashCommands(token).catch((err) =>
         console.error(`[Discord] Failed to register slash commands: ${err}`),
       );
-      runPendingResume(token).catch((err) =>
-        console.error(`[Discord] Pending resume failed: ${err instanceof Error ? err.message : err}`),
-      );
       break;
 
     case "RESUMED":
-      console.log("[Discord] Session resumed — skipping REST rejoin (session intact)");
-      rejoinThreads(token, "RESUMED").catch((err) =>
+      console.log("[Discord] Session resumed — rejoining threads");
+      rejoinThreads(token).catch((err) =>
         console.error(`[Discord] Failed to rejoin threads on RESUMED: ${err}`),
       );
       break;
@@ -1468,41 +986,30 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       );
       break;
 
-    case "GUILD_CREATE": {
-      // Cache active threads and collect member status for targeted rejoin
-      const memberThreadIds = new Set<string>();
+    case "GUILD_CREATE":
+      // Cache active threads for multi-session support
       if (data.threads) {
         console.log(`[Discord] GUILD_CREATE: ${data.threads.length} active threads in guild ${data.id}`);
         for (const thread of data.threads) {
-          upsertThread(thread.id, thread.parent_id, thread.name);
-          const memberStatus = thread.member ? "yes" : "no";
-          console.log(
-            `[Discord]   thread: ${thread.id} name="${thread.name}" parent=${thread.parent_id} member=${memberStatus}`,
-          );
-          if (thread.member) memberThreadIds.add(thread.id);
+          knownThreads.set(thread.id, { parentId: thread.parent_id });
+          console.log(`[Discord]   thread: ${thread.id} name="${thread.name}" parent=${thread.parent_id}`);
         }
       } else {
         console.log(`[Discord] GUILD_CREATE: no active threads in guild ${data.id}`);
       }
-      // Rejoin threads: PUT-only for member=yes, DELETE+PUT for others
-      rejoinThreads(token, "GUILD_CREATE", memberThreadIds).catch((err) =>
+      // Rejoin all known threads from sessions.json so gateway sends MESSAGE_CREATE
+      rejoinThreads(token).catch((err) =>
         console.error(`[Discord] Failed to rejoin threads: ${err}`),
       );
       handleGuildCreate(token, data).catch((err) =>
         console.error(`[Discord] GUILD_CREATE unhandled: ${err}`),
       );
       break;
-    }
 
     case "THREAD_CREATE":
       if (data.id && data.parent_id) {
-        upsertThread(data.id, data.parent_id, data.name);
-        debugLog(`Thread tracked: ${data.id} (parent: ${data.parent_id} name: ${data.name ?? "unknown"})`);
-        if (getSettings().discord.listenChannels.includes(data.parent_id)) {
-          discordApi(token, "PUT", `/channels/${data.id}/thread-members/@me`).catch((err) =>
-            console.error(`[Discord] Failed to join thread ${data.id}: ${err}`),
-          );
-        }
+        knownThreads.set(data.id, { parentId: data.parent_id });
+        debugLog(`Thread tracked: ${data.id} (parent: ${data.parent_id})`);
       }
       break;
 
@@ -1525,7 +1032,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
           );
           debugLog(`Thread archived and cleaned up: ${data.id}`);
         } else {
-          upsertThread(data.id, data.parent_id, data.name);
+          knownThreads.set(data.id, { parentId: data.parent_id });
         }
       }
       break;
@@ -1533,7 +1040,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
     case "THREAD_LIST_SYNC":
       if (data.threads) {
         for (const thread of data.threads) {
-          upsertThread(thread.id, thread.parent_id, thread.name);
+          knownThreads.set(thread.id, { parentId: thread.parent_id });
         }
       }
       break;
@@ -1564,23 +1071,24 @@ function handleGatewayPayload(token: string, payload: GatewayPayload): void {
       break;
 
     case GatewayOp.RECONNECT:
-      console.log("[Discord][GW] op=RECONNECT — gateway requested reconnect");
+      debugLog("Gateway requested reconnect");
       ws?.close(4000, "Reconnect requested");
       break;
 
     case GatewayOp.INVALID_SESSION: {
       const resumable = payload.d;
-      console.log(`[Discord][GW] op=INVALID_SESSION resumable=${resumable}`);
-      if (resumable && gatewaySessionId) {
-        setTimeout(() => sendResume(token), 1000 + Math.random() * 4000);
-      } else {
-        // Close the ws so onclose opens a fresh connection and sends IDENTIFY from scratch.
-        // Sending IDENTIFY on the same ws that just failed RESUME causes Discord to not
-        // restore thread message delivery for the new session.
+      debugLog(`Invalid session, resumable=${resumable}`);
+      if (!resumable) {
         gatewaySessionId = null;
         lastSequence = null;
-        ws?.close(4000, "Non-resumable INVALID_SESSION — reconnecting fresh");
       }
+      setTimeout(() => {
+        if (resumable && gatewaySessionId) {
+          sendResume(token);
+        } else {
+          sendIdentify(token);
+        }
+      }, 1000 + Math.random() * 4000);
       break;
     }
 
@@ -1673,12 +1181,9 @@ export function startGateway(debug = false): void {
   if (ws) stopGateway();
   running = true;
   console.log("Discord bot started (gateway)");
-  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "none (deny all)" : config.allowedUserIds.join(", ")}`);
+  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);
   if (config.listenChannels.length > 0) {
     console.log(`  Listen channels: ${config.listenChannels.join(", ")}`);
-  }
-  if (config.listenGuilds.length > 0) {
-    console.log(`  Listen guilds: ${config.listenGuilds.join(", ")}`);
   }
   if (discordDebug) console.log("  Debug: enabled");
 
@@ -1702,7 +1207,7 @@ export async function discord() {
   }
 
   console.log("Discord bot started (gateway, standalone)");
-  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "none (deny all)" : config.allowedUserIds.join(", ")}`);
+  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);
   if (discordDebug) console.log("  Debug: enabled");
 
   connectGateway(config.token);

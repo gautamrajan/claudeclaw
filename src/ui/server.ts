@@ -1,16 +1,10 @@
 import { htmlPage } from "./page/html";
 import { clampInt, json } from "./http";
-import { checkToken } from "./auth";
 import type { StartWebUiOptions, WebServerHandle } from "./types";
 import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/state";
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
-import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
-import { getSessionUsage } from "./services/usage";
-import { runUserMessage } from "../runner";
-import { tmpdir } from "os";
-import { randomUUID } from "crypto";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -20,60 +14,14 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     fetch: async (req) => {
       const url = new URL(req.url);
 
-      // Task 1.2: Reject DNS rebinding attacks via Host header validation.
-      // Wildcard bind addresses (0.0.0.0, ::) mean the user opted into remote access —
-      // the browser Host header won't match the bind address, so we skip the check.
-      // For specific bind addresses (loopback or LAN IP) we enforce the allowlist.
-      const host = req.headers.get("host") ?? "";
-      const isWildcardBind = opts.host === "0.0.0.0" || opts.host === "::";
-      if (!isWildcardBind) {
-        const expectedHosts = new Set([
-          `127.0.0.1:${opts.port}`,
-          `localhost:${opts.port}`,
-          `[::1]:${opts.port}`,
-          `${opts.host}:${opts.port}`,
-        ]);
-        if (!expectedHosts.has(host)) {
-          return new Response("Bad Host", { status: 421 });
-        }
-      }
-
-      // Task 1.3: CSRF defense — reject cross-origin requests for state-changing methods.
-      // Accept both http and https origins for validated hosts.
-      if (req.method === "POST" || req.method === "DELETE") {
-        const origin = req.headers.get("origin");
-        if (origin) {
-          const allowedOrigins = new Set([`http://${host}`, `https://${host}`]);
-          if (!allowedOrigins.has(origin)) {
-            return new Response("Bad Origin", { status: 403 });
-          }
-        }
-      }
-
       if (url.pathname === "/" || url.pathname === "/index.html") {
         return new Response(htmlPage(), {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       }
 
-      // Health check is intentionally pre-auth so monitors and load balancers work unauthenticated.
       if (url.pathname === "/api/health") {
         return json({ ok: true, now: Date.now() });
-      }
-
-      // Task 1.1: Require bearer token for all /api/* routes.
-      // /api/inject also accepts the legacy settings.apiToken so existing automation isn't broken.
-      if (url.pathname.startsWith("/api/")) {
-        const apiToken = opts.getSnapshot().settings.apiToken;
-        const validWebToken = checkToken(req, opts.token);
-        const validApiToken =
-          url.pathname === "/api/inject" && !!apiToken && checkToken(req, apiToken);
-        if (!validWebToken && !validApiToken) {
-          return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
-            status: 401,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
       }
 
       if (url.pathname === "/api/state") {
@@ -201,62 +149,55 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         return json(await readLogs(tail));
       }
 
-      if (url.pathname === "/api/sessions" && req.method === "GET") {
-        try {
-          return json(await listSessions());
-        } catch (err) {
-          return json({ ok: false, error: String(err) });
+      if (url.pathname === "/api/approval/request" && req.method === "POST") {
+        if (!opts.onApprovalRequest) {
+          return json({ ok: false, error: "approval not configured" }, { status: 503 });
         }
-      }
-
-      if (url.pathname === "/api/usage" && req.method === "GET") {
-        try {
-          const channelNames = opts.getSnapshot().settings.discord?.channelNames;
-          return json(await getSessionUsage(channelNames));
-        } catch (err) {
-          return json({ ok: false, error: String(err) });
-        }
-      }
-
-      if (url.pathname === "/api/agents" && req.method === "GET") {
-        try {
-          return json(await listAgents());
-        } catch (err) {
-          return json({ ok: false, error: String(err) });
-        }
-      }
-
-      if (url.pathname.startsWith("/api/sessions/") && url.pathname.endsWith("/messages") && req.method === "GET") {
-        const sessionId = url.pathname.slice("/api/sessions/".length, -"/messages".length);
-        const limit = clampInt(url.searchParams.get("limit"), 10, 1, 2000);
-        const rawOffset = url.searchParams.get("offset");
-        const offset = rawOffset === "-1" ? -1 : clampInt(rawOffset, 0, 0, 100_000);
-        try {
-          return json(await readSessionMessages(sessionId, limit, offset));
-        } catch (err) {
-          return json({ ok: false, error: String(err) });
-        }
-      }
-
-      if (url.pathname === "/api/inject" && req.method === "POST") {
         try {
           const body = await req.json();
-          const message = typeof body.message === "string" ? body.message.trim() : "";
-          if (!message) return json({ ok: false, error: "message is required" }, 400);
-          const result = await runUserMessage("inject", message);
-          const text = result.stdout.trim();
-          const { telegram } = opts.getSnapshot().settings;
-          if (text && telegram.token && telegram.allowedUserIds.length > 0) {
-            const chatId = telegram.allowedUserIds[0];
-            fetch(`https://api.telegram.org/bot${telegram.token}/sendMessage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: chatId, text }),
-            }).catch(() => {});
-          }
-          return json({ ok: true, result: result.stdout, exitCode: result.exitCode });
+          const toolName = typeof body?.toolName === "string" ? body.toolName.trim() : "";
+          if (!toolName) return json({ ok: false, error: "toolName required" }, { status: 400 });
+          const description = typeof body?.description === "string" ? body.description : undefined;
+          const request = await opts.onApprovalRequest(toolName, body?.toolInput, description);
+          return json({ ok: true, request });
         } catch (err) {
-          return json({ ok: false, error: String(err) }, 500);
+          return json({ ok: false, error: String(err) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname.startsWith("/api/approval/result/") && req.method === "GET") {
+        if (!opts.onApprovalAwait) {
+          return json({ ok: false, error: "approval not configured" }, { status: 503 });
+        }
+        const id = decodeURIComponent(url.pathname.slice("/api/approval/result/".length));
+        if (!id) return json({ ok: false, error: "id required" }, { status: 400 });
+        const waitMs = clampInt(url.searchParams.get("waitMs"), 30000, 0, 300000);
+        try {
+          const outcome = await opts.onApprovalAwait(id, waitMs);
+          return json({ ok: true, ...outcome });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname.startsWith("/api/approval/resolve/") && req.method === "POST") {
+        if (!opts.onApprovalResolve) {
+          return json({ ok: false, error: "approval not configured" }, { status: 503 });
+        }
+        const id = decodeURIComponent(url.pathname.slice("/api/approval/resolve/".length));
+        if (!id) return json({ ok: false, error: "id required" }, { status: 400 });
+        try {
+          const body = await req.json();
+          const decision = body?.decision;
+          if (decision !== "approve" && decision !== "approve_always" && decision !== "deny") {
+            return json({ ok: false, error: "decision must be approve|approve_always|deny" }, { status: 400 });
+          }
+          const pattern = typeof body?.pattern === "string" ? body.pattern : undefined;
+          const reason = typeof body?.reason === "string" ? body.reason : undefined;
+          const resolved = await opts.onApprovalResolve(id, { decision, pattern, reason });
+          return json({ ok: resolved, resolved });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, { status: 500 });
         }
       }
 
@@ -265,74 +206,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         try {
           const body = await req.json();
           const message = String(body?.message ?? "").trim();
-
-          interface Attachment {
-            name: string;
-            type: string;
-            data: string; // base64
-          }
-
-          const rawAttachments = Array.isArray(body?.attachments) ? (body.attachments as unknown[]) : [];
-
-          // Validate attachments
-          if (rawAttachments.length > 5) {
-            return json({ ok: false, error: "too many attachments (max 5)" }, 400);
-          }
-
-          const attachments: Attachment[] = [];
-          for (const raw of rawAttachments) {
-            if (!raw || typeof raw !== "object") continue;
-            const att = raw as Record<string, unknown>;
-            const name = String(att.name ?? "");
-            const type = String(att.type ?? "");
-            const data = String(att.data ?? "");
-            // base64 decoded size approximation
-            const decodedSize = data.length * 0.75;
-            if (decodedSize > 10 * 1024 * 1024) {
-              return json({ ok: false, error: `attachment "${name}" exceeds 10 MB limit` }, 400);
-            }
-            attachments.push({ name, type, data });
-          }
-
-          if (!message && attachments.length === 0) {
-            return json({ ok: false, error: "message required" });
-          }
-
-          const TEXT_EXTENSIONS = new Set([
-            "js", "ts", "py", "json", "yaml", "yml", "md", "txt", "csv",
-            "xml", "sh", "sql", "toml", "ini", "env", "log",
-          ]);
-
-          const tempImagePaths: string[] = [];
-          const attachmentBlocks: string[] = [];
-
-          for (const att of attachments) {
-            const ext = att.name.includes(".") ? att.name.split(".").pop()!.toLowerCase() : "";
-            if (att.type.startsWith("text/") || TEXT_EXTENSIONS.has(ext)) {
-              const content = Buffer.from(att.data, "base64").toString("utf-8");
-              attachmentBlocks.push(
-                `[Attached file: ${att.name}]\n\`\`\`${ext}\n${content}\n\`\`\``
-              );
-            } else if (att.type.startsWith("image/")) {
-              const uploadDir = `${tmpdir()}/claudeclaw-uploads`;
-              await import("fs/promises").then(({ mkdir }) => mkdir(uploadDir, { recursive: true })).catch(() => {});
-              const filePath = `${uploadDir}/${randomUUID()}.${ext || "bin"}`;
-              const buffer = Buffer.from(att.data, "base64");
-              await Bun.write(filePath, buffer);
-              tempImagePaths.push(filePath);
-              attachmentBlocks.push(
-                `[Attached image: ${att.name} — file saved at ${filePath}, you can read it with your Read tool]`
-              );
-            } else {
-              attachmentBlocks.push(
-                `[Attached file: ${att.name} — unsupported type, content not included]`
-              );
-            }
-          }
-
-          const enrichedMessage = attachmentBlocks.length > 0
-            ? attachmentBlocks.join("\n\n") + (message ? "\n\n" + message : "")
-            : message;
+          if (!message) return json({ ok: false, error: "message required" });
 
           const encoder = new TextEncoder();
           const onChat = opts.onChat;
@@ -343,24 +217,15 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
               };
               try {
                 await onChat(
-                  enrichedMessage,
+                  message,
                   (chunk) => send({ type: "chunk", text: chunk }),
-                  () => send({ type: "unblock" }),
-                  (ev) => send({ type: ev.type === "spawn" ? "agent_spawn" : "agent_done", id: ev.id, description: ev.description, result: ev.result })
+                  () => send({ type: "unblock" })
                 );
                 send({ type: "done" });
               } catch (err) {
                 send({ type: "error", message: String(err) });
               } finally {
                 controller.close();
-                // Fire-and-forget cleanup of temp image files
-                for (const p of tempImagePaths) {
-                  Bun.file(p).exists().then((exists) => {
-                    if (exists) {
-                      import("fs").then(({ unlink }) => unlink(p, () => {})).catch(() => {});
-                    }
-                  }).catch(() => {});
-                }
               }
             },
           });

@@ -5,18 +5,7 @@ const HEARTBEAT_DIR = join(process.cwd(), ".claude", "claudeclaw");
 // Write state.json so the statusline script can read fresh data
 export interface StateData {
   heartbeat?: { nextAt: number };
-  jobs: {
-    name: string;
-    nextAt: number;
-    /** Outcome of the most recent run. Absent until the job runs at least once. */
-    lastResult?: "ok" | "error" | "skipped";
-    /** Unix timestamp (ms) of the most recent completion. Absent until first run. */
-    lastRanAt?: number;
-    /** Number of consecutive failures since last success. Present only while retrying. */
-    failCount?: number;
-    /** Unix timestamp (ms) when the next retry fires. Present only while retrying. */
-    retryAt?: number;
-  }[];
+  jobs: { name: string; nextAt: number }[];
   security: string;
   telegram: boolean;
   discord: boolean;

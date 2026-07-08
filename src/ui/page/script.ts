@@ -1,37 +1,4 @@
-export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
-    (function() {
-      var stored = sessionStorage.getItem("__claw_tok");
-      var fromUrl = new URL(location.href).searchParams.get("token");
-      if (fromUrl) {
-        stored = fromUrl;
-        sessionStorage.setItem("__claw_tok", stored);
-        var clean = new URL(location.href);
-        clean.searchParams.delete("token");
-        history.replaceState(null, "", clean.toString());
-      }
-      if (!stored) {
-        document.addEventListener("DOMContentLoaded", function() {
-          document.body.innerHTML = '<div style="font-family:monospace;padding:2rem;max-width:480px;margin:4rem auto">' +
-            '<h2 style="margin-bottom:1rem">ClaudeClaw — Auth Required</h2>' +
-            '<p style="margin-bottom:1rem">Paste the token from the daemon log to continue.</p>' +
-            '<input id="tok-input" type="text" placeholder="Token" style="width:100%;padding:.5rem;margin-bottom:.75rem;font-family:monospace;box-sizing:border-box">' +
-            '<button onclick="var t=document.getElementById(\'tok-input\').value.trim();if(t){sessionStorage.setItem(\'__claw_tok\',t);location.reload();}" ' +
-            'style="padding:.5rem 1.25rem;cursor:pointer">Continue</button></div>';
-        });
-        return;
-      }
-      var _origFetch = window.fetch.bind(window);
-      window.fetch = function(input, init) {
-        var url = typeof input === "string" ? input : (input instanceof URL ? input.href : input.url);
-        if (typeof url === "string" && url.startsWith("/api/")) {
-          init = Object.assign({}, init);
-          init.headers = Object.assign({ "Authorization": "Bearer " + stored }, init.headers);
-        }
-        return _origFetch(input, init);
-      };
-    })();
-
-    const $ = (id) => document.getElementById(id);
+export const pageScript = String.raw`    const $ = (id) => document.getElementById(id);
 
     const clockEl = $("clock");
     const dateEl = $("date");
@@ -968,114 +935,12 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
     // ── Chat ──
     const tabDashboardBtn = $("tab-dashboard");
     const tabChatBtn = $("tab-chat");
-    const tabUsageBtn = $("tab-usage");
     const dashboardPanel = $("dashboard-panel");
     const chatPanel = $("chat-panel");
-    const usagePanel = $("usage-panel");
     const chatMessages = $("chat-messages");
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
     const chatSend = $("chat-send");
-    const chatAttachBtn = $("chat-attach");
-    const chatFileInput = $("chat-file-input");
-    const chatAttachmentsEl = $("chat-attachments");
-
-    // Attachment state
-    var pendingAttachments = []; // Array of { name, type, data } where data is base64
-
-    function renderAttachmentChips() {
-      if (!chatAttachmentsEl) return;
-      if (pendingAttachments.length === 0) {
-        chatAttachmentsEl.hidden = true;
-        chatAttachmentsEl.innerHTML = "";
-        return;
-      }
-      chatAttachmentsEl.hidden = false;
-      chatAttachmentsEl.innerHTML = pendingAttachments.map(function(att, idx) {
-        return (
-          '<span class="attach-chip">' +
-            '<span class="attach-chip-name" title="' + escAttr(att.name) + '">' + esc(att.name) + '</span>' +
-            '<button class="attach-chip-remove" type="button" data-attach-index="' + idx + '" aria-label="Remove ' + escAttr(att.name) + '">×</button>' +
-          '</span>'
-        );
-      }).join("");
-    }
-
-    function readFileAsBase64(file) {
-      return new Promise(function(resolve, reject) {
-        var reader = new FileReader();
-        reader.onload = function(e) {
-          var result = e.target.result;
-          // Strip the data URL prefix: "data:<type>;base64,<data>"
-          var base64 = typeof result === "string" ? result.split(",")[1] || "" : "";
-          resolve(base64);
-        };
-        reader.onerror = function() { reject(new Error("Failed to read file")); };
-        reader.readAsDataURL(file);
-      });
-    }
-
-    if (chatAttachBtn && chatFileInput) {
-      chatAttachBtn.addEventListener("click", function() {
-        if (chatBusy) return;
-        chatFileInput.click();
-      });
-    }
-
-    if (chatFileInput) {
-      chatFileInput.addEventListener("change", async function() {
-        var files = chatFileInput.files;
-        if (!files || !files.length) return;
-        var warnEl = $("chat-attach-warn");
-        if (warnEl) warnEl.remove();
-
-        for (var i = 0; i < files.length; i++) {
-          var file = files[i];
-          if (pendingAttachments.length >= 5) {
-            var warn = document.createElement("div");
-            warn.id = "chat-attach-warn";
-            warn.className = "attach-warn";
-            warn.textContent = "Max 5 attachments allowed.";
-            if (chatAttachmentsEl && chatAttachmentsEl.parentNode) {
-              chatAttachmentsEl.parentNode.insertBefore(warn, chatAttachmentsEl.nextSibling);
-            }
-            break;
-          }
-          if (file.size > 10 * 1024 * 1024) {
-            var warnSize = document.createElement("div");
-            warnSize.id = "chat-attach-warn";
-            warnSize.className = "attach-warn";
-            warnSize.textContent = '"' + file.name + '" exceeds 10 MB limit.';
-            if (chatAttachmentsEl && chatAttachmentsEl.parentNode) {
-              chatAttachmentsEl.parentNode.insertBefore(warnSize, chatAttachmentsEl.nextSibling);
-            }
-            continue;
-          }
-          try {
-            var base64 = await readFileAsBase64(file);
-            pendingAttachments.push({ name: file.name, type: file.type || "application/octet-stream", data: base64 });
-          } catch (_) {}
-        }
-        // Reset so same file can be re-selected if removed
-        chatFileInput.value = "";
-        renderAttachmentChips();
-      });
-    }
-
-    // Remove chip on click (delegated)
-    if (chatAttachmentsEl) {
-      chatAttachmentsEl.addEventListener("click", function(event) {
-        var target = event.target;
-        if (!(target instanceof HTMLElement)) return;
-        var btn = target.closest("[data-attach-index]");
-        if (!btn || !(btn instanceof HTMLElement)) return;
-        var idx = parseInt(btn.getAttribute("data-attach-index") || "-1", 10);
-        if (idx >= 0 && idx < pendingAttachments.length) {
-          pendingAttachments.splice(idx, 1);
-          renderAttachmentChips();
-        }
-      });
-    }
 
     var CHAT_STORAGE_KEY = "claudeclaw.chat.history";
     let chatBusy = false;
@@ -1090,8 +955,8 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
     })();
 
     function setActiveTab(tab) {
-      const allBtns = [tabDashboardBtn, tabChatBtn, tabUsageBtn];
-      const allPanels = [dashboardPanel, chatPanel, usagePanel];
+      const allBtns = [tabDashboardBtn, tabChatBtn];
+      const allPanels = [dashboardPanel, chatPanel];
       allBtns.forEach(b => { if (b) { b.classList.remove("tab-btn-active"); b.setAttribute("aria-selected", "false"); } });
       allPanels.forEach(p => { if (p) p.hidden = true; });
 
@@ -1099,11 +964,6 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
         tabDashboardBtn && tabDashboardBtn.classList.add("tab-btn-active");
         tabDashboardBtn && tabDashboardBtn.setAttribute("aria-selected", "true");
         if (dashboardPanel) dashboardPanel.hidden = false;
-      } else if (tab === "usage") {
-        tabUsageBtn && tabUsageBtn.classList.add("tab-btn-active");
-        tabUsageBtn && tabUsageBtn.setAttribute("aria-selected", "true");
-        if (usagePanel) usagePanel.hidden = false;
-        fetchUsage();
       } else {
         tabChatBtn && tabChatBtn.classList.add("tab-btn-active");
         tabChatBtn && tabChatBtn.setAttribute("aria-selected", "true");
@@ -1113,155 +973,13 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
     }
 
     if (tabDashboardBtn) tabDashboardBtn.addEventListener("click", () => setActiveTab("dashboard"));
-    if (tabChatBtn) tabChatBtn.addEventListener("click", function() { setActiveTab("chat"); loadSessions(); });
-    if (tabUsageBtn) tabUsageBtn.addEventListener("click", function() { setActiveTab("usage"); });
-
-    // --- Session browser ---
-
-    var activeBrowseSessionId = null;
-    var browseOffset = 0;
-    var browseTotalCount = 0;
-    var BROWSE_PAGE = 10;
-
-    function escapeHtml(text) {
-      var d = document.createElement("div");
-      d.textContent = text;
-      return d.innerHTML;
-    }
-
-    function formatSessionTime(isoStr) {
-      if (!isoStr) return "";
-      try {
-        var d = new Date(isoStr);
-        var now = new Date();
-        if (d.toDateString() === now.toDateString()) {
-          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-        }
-        return d.toLocaleDateString([], { month: "short", day: "numeric" });
-      } catch { return ""; }
-    }
-
-    async function loadSessions() {
-      var listEl = document.getElementById("session-list");
-      if (!listEl) return;
-      try {
-        var res = await fetch("/api/sessions");
-        var sessions = await res.json();
-        if (!Array.isArray(sessions) || sessions.length === 0) {
-          listEl.innerHTML = '<div class="session-loading">No sessions yet</div>';
-          return;
-        }
-        listEl.innerHTML = "";
-        sessions.forEach(function(s) {
-          var item = document.createElement("div");
-          item.className = "session-item" + (s.id === activeBrowseSessionId ? " active" : "");
-          var preview = escapeHtml(s.lastMessage || s.firstMessage || "(empty)");
-          var channel = s.channel && s.channel !== "web" ? s.channel : "";
-          item.innerHTML =
-            '<div class="session-item-header">'
-            + '<span class="session-agent">' + escapeHtml(s.agent || "global") + "</span>"
-            + (channel ? '<span class="session-channel">' + escapeHtml(channel) + "</span>" : "")
-            + "</div>"
-            + '<div class="session-preview">' + preview + "</div>"
-            + '<div class="session-time">' + formatSessionTime(s.lastUsedAt) + " · " + (s.turnCount || 0) + " turns</div>";
-          item.addEventListener("click", function() { browseSession(s.id); });
-          listEl.appendChild(item);
-        });
-      } catch (e) {
-        listEl.innerHTML = '<div class="session-loading">Failed to load</div>';
-      }
-    }
-
-    async function browseSession(sessionId) {
-      activeBrowseSessionId = sessionId;
-      browseOffset = 0;
-      browseTotalCount = 0;
-
-      // Update sidebar highlight
-      document.querySelectorAll(".session-item").forEach(function(el) {
-        el.classList.toggle("active", el.dataset && el.dataset.sid === sessionId);
-      });
-      // Re-render sidebar to apply active class correctly
-      loadSessions();
-
-      // Show history banner
-      var banner = document.getElementById("chat-history-banner");
-      if (banner) banner.hidden = false;
-
-      // Load messages
-      chatHistory = [];
-      renderChatHistory();
-      await loadBrowseMessages(sessionId, false);
-    }
-
-    async function loadBrowseMessages(sessionId, loadMore) {
-      var loadMoreContainer = document.getElementById("load-more-container");
-      var loadMoreBtn = document.getElementById("load-more-btn");
-      if (!loadMore) {
-        try {
-          // Single fetch: last N messages + total count in one response.
-          var res = await fetch("/api/sessions/" + sessionId + "/messages?limit=" + BROWSE_PAGE + "&offset=-1");
-          var data = await res.json();
-          var msgs = data.messages;
-          if (!Array.isArray(msgs)) return;
-          browseTotalCount = typeof data.total === "number" ? data.total : msgs.length;
-          browseOffset = Math.max(0, browseTotalCount - BROWSE_PAGE);
-          chatHistory = msgs.map(function(m) { return { role: m.role, text: m.text }; });
-          renderChatHistory();
-          if (loadMoreContainer) loadMoreContainer.hidden = browseOffset <= 0;
-          if (loadMoreBtn && browseOffset > 0) loadMoreBtn.textContent = "Load older (" + browseOffset + " more)";
-        } catch (e) {}
-      } else {
-        var newOffset = Math.max(0, browseOffset - BROWSE_PAGE);
-        var limit = browseOffset - newOffset;
-        if (limit <= 0) return;
-        try {
-          var res2 = await fetch("/api/sessions/" + sessionId + "/messages?limit=" + limit + "&offset=" + newOffset);
-          var data2 = await res2.json();
-          var older = data2.messages;
-          if (!Array.isArray(older)) return;
-          var chatMsgsEl = document.getElementById("chat-messages");
-          var scrollHeightBefore = chatMsgsEl ? chatMsgsEl.scrollHeight : 0;
-          chatHistory = older.map(function(m) { return { role: m.role, text: m.text }; }).concat(chatHistory);
-          browseOffset = newOffset;
-          renderChatHistory();
-          if (chatMsgsEl) chatMsgsEl.scrollTop = chatMsgsEl.scrollHeight - scrollHeightBefore;
-          if (loadMoreContainer) loadMoreContainer.hidden = browseOffset <= 0;
-          if (loadMoreBtn && browseOffset > 0) loadMoreBtn.textContent = "Load older (" + browseOffset + " more)";
-        } catch (e) {}
-      }
-    }
-
-    var newSessionBtn = document.getElementById("new-session-btn");
-    if (newSessionBtn) {
-      newSessionBtn.addEventListener("click", function() {
-        activeBrowseSessionId = null;
-        chatHistory = [];
-        renderChatHistory();
-        var banner = document.getElementById("chat-history-banner");
-        if (banner) banner.hidden = true;
-        var loadMoreContainer = document.getElementById("load-more-container");
-        if (loadMoreContainer) loadMoreContainer.hidden = true;
-        document.querySelectorAll(".session-item").forEach(function(el) { el.classList.remove("active"); });
-        if (chatInput) chatInput.focus();
-      });
-    }
-
-    var loadMoreBtn = document.getElementById("load-more-btn");
-    if (loadMoreBtn) {
-      loadMoreBtn.addEventListener("click", function() {
-        if (activeBrowseSessionId) loadBrowseMessages(activeBrowseSessionId, true);
-      });
-    }
-
-    // Load sessions on initial render
-    loadSessions();
+    if (tabChatBtn) tabChatBtn.addEventListener("click", () => setActiveTab("chat"));
 
     renderChatHistory();
 
     function saveChatHistory() {
       try {
-        var toSave = chatHistory.filter(function(m) { return !m.streaming && m.agentStatus !== "running"; });
+        var toSave = chatHistory.filter(function(m) { return !m.streaming; });
         localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(toSave));
       } catch (_) {}
     }
@@ -1277,7 +995,6 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
       var cancelBtn = $("chat-cancel");
       if (chatSend) chatSend.disabled = busy;
       if (cancelBtn) cancelBtn.hidden = !busy;
-      if (chatAttachBtn) chatAttachBtn.disabled = busy;
       if (busy) {
         chatStartedAt = Date.now();
         chatElapsedTimer = setInterval(function() {
@@ -1313,26 +1030,6 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
     }
 
     function syncChatMessageEl(msgEl, msg, elapsedMs) {
-      // Agent bubbles: simple centered pill, no role/text structure
-      if (msg.role === "agent") {
-        var agentCls = "chat-msg chat-msg-agent" + (msg.agentStatus === "running" ? " chat-msg-agent-running" : " chat-msg-agent-done");
-        if (msgEl.className !== agentCls) msgEl.className = agentCls;
-        var agentPlainText = msg.text || "";
-        var existingSpinner = msgEl.querySelector(".chat-agent-spinner");
-        if (msgEl.dataset.agentText !== agentPlainText || msgEl.dataset.agentStatus !== msg.agentStatus) {
-          msgEl.textContent = agentPlainText;
-          msgEl.dataset.agentText = agentPlainText;
-          msgEl.dataset.agentStatus = msg.agentStatus || "";
-          if (msg.agentStatus === "running") {
-            var spinner = document.createElement("span");
-            spinner.className = "chat-agent-spinner";
-            spinner.textContent = "…";
-            msgEl.appendChild(spinner);
-          }
-        }
-        return;
-      }
-
       var roleEl = msgEl.querySelector(".chat-msg-role");
       var textEl = msgEl.querySelector(".chat-msg-text");
       if (!roleEl || !textEl) {
@@ -1422,20 +1119,13 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
     async function sendChat() {
       if (chatBusy || !chatInput) return;
       var message = (chatInput.value || "").trim();
-      var attachmentsToSend = pendingAttachments.slice();
-      if (!message && attachmentsToSend.length === 0) return;
+      if (!message) return;
 
       chatInput.value = "";
       autoResizeChatInput();
-
-      // Clear pending attachments and hide chip area
-      pendingAttachments = [];
-      renderAttachmentChips();
-
       setChatBusy(true);
 
-      var userText = message || ("(" + attachmentsToSend.length + " attachment" + (attachmentsToSend.length !== 1 ? "s" : "") + ")");
-      chatHistory.push({ role: "user", text: userText });
+      chatHistory.push({ role: "user", text: message });
       var assistantIdx = chatHistory.length;
       chatHistory.push({ role: "assistant", text: "", streaming: true });
       renderChatHistory();
@@ -1446,7 +1136,7 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
         var res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: message, attachments: attachmentsToSend }),
+          body: JSON.stringify({ message: message }),
           signal: chatAbortController.signal,
         });
 
@@ -1476,25 +1166,6 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
                 setChatBusy(false);
                 chatHistory[assistantIdx].background = true;
                 renderChatHistory();
-              } else if (ev.type === "agent_spawn") {
-                chatHistory.push({ role: "agent", agentId: ev.id, text: "🤖 Sub-agent started: " + ev.description, agentStatus: "running" });
-                renderChatHistory();
-              } else if (ev.type === "agent_done") {
-                var agentBubble = null;
-                for (var k = chatHistory.length - 1; k >= 0; k--) {
-                  if (chatHistory[k].role === "agent" && chatHistory[k].agentId === ev.id) {
-                    agentBubble = chatHistory[k];
-                    break;
-                  }
-                }
-                if (agentBubble) {
-                  agentBubble.agentStatus = "done";
-                  agentBubble.text = "✅ Sub-agent done: " + ev.description;
-                } else {
-                  chatHistory.push({ role: "agent", agentId: ev.id, text: "✅ Sub-agent done: " + ev.description, agentStatus: "done" });
-                }
-                renderChatHistory();
-                saveChatHistory();
               } else if (ev.type === "done") {
                 chatHistory[assistantIdx].streaming = false;
                 chatHistory[assistantIdx].background = false;
@@ -1557,85 +1228,4 @@ export const pageScript = String.raw`    // --- Token management (Task 1.1) ---
         var elapsedEl = chatMessages.querySelector(".chat-msg-elapsed");
         if (elapsedEl) elapsedEl.textContent = fmtElapsed(Date.now() - chatStartedAt);
       }
-    }, 1000);
-
-    // --- Usage monitoring ---
-    var usageWrap = $("usage-table-wrap");
-
-    function fmtTokens(n) {
-      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-      if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
-      return String(n);
-    }
-
-    function fmtCost(usd) {
-      if (usd <= 0) return "$0.00";
-      if (usd < 0.01) return "<$0.01";
-      return "$" + usd.toFixed(2);
-    }
-
-    function fmtRelative(iso) {
-      if (!iso) return "—";
-      var delta = Date.now() - new Date(iso).getTime();
-      var s = Math.floor(delta / 1000);
-      if (s < 60) return s + "s ago";
-      var m = Math.floor(s / 60);
-      if (m < 60) return m + "m ago";
-      var h = Math.floor(m / 60);
-      if (h < 24) return h + "h ago";
-      return Math.floor(h / 24) + "d ago";
-    }
-
-    function renderUsageTable(sessions) {
-      if (!usageWrap) return;
-      if (!sessions || sessions.length === 0) {
-        usageWrap.innerHTML = '<div class="usage-loading">No active sessions found.</div>';
-        return;
-      }
-      var maxCost = sessions.reduce(function(m, s) { return Math.max(m, s.estimatedCostUsd); }, 0);
-      var rows = sessions.map(function(s) {
-        var barPct = maxCost > 0 ? Math.round((s.estimatedCostUsd / maxCost) * 100) : 0;
-        var channelIcon = s.channel === "discord" ? "🎮" : s.channel === "web" ? "🌐" : "❓";
-        return "<tr>" +
-          "<td class='usage-td usage-td-label'>" + channelIcon + " " + esc(s.label) + "</td>" +
-          "<td class='usage-td usage-td-num'>" + fmtTokens(s.inputTokens) + "</td>" +
-          "<td class='usage-td usage-td-num'>" + fmtTokens(s.outputTokens) + "</td>" +
-          "<td class='usage-td usage-td-num'>" + fmtTokens(s.cacheReadTokens) + "</td>" +
-          "<td class='usage-td usage-td-num'>" + s.cacheHitPct + "%</td>" +
-          "<td class='usage-td usage-td-cost'>" +
-            "<div class='usage-cost-wrap'>" +
-              "<div class='usage-cost-bar' style='width:" + barPct + "%'></div>" +
-              "<span class='usage-cost-label'>~" + fmtCost(s.estimatedCostUsd) + "</span>" +
-            "</div>" +
-          "</td>" +
-          "<td class='usage-td usage-td-num usage-td-turns'>" + s.turnCount + "</td>" +
-          "<td class='usage-td usage-td-age'>" + fmtRelative(s.lastUsedAt) + "</td>" +
-          "</tr>";
-      }).join("");
-      usageWrap.innerHTML =
-        "<table class='usage-table'>" +
-        "<thead><tr>" +
-        "<th class='usage-th'>Session</th>" +
-        "<th class='usage-th usage-th-num'>Input</th>" +
-        "<th class='usage-th usage-th-num'>Output</th>" +
-        "<th class='usage-th usage-th-num'>Cache Read</th>" +
-        "<th class='usage-th usage-th-num'>Cache Hit</th>" +
-        "<th class='usage-th'>Est. Cost</th>" +
-        "<th class='usage-th usage-th-num'>Turns</th>" +
-        "<th class='usage-th'>Last Active</th>" +
-        "</tr></thead>" +
-        "<tbody>" + rows + "</tbody>" +
-        "</table>";
-    }
-
-    function fetchUsage() {
-      fetch("/api/usage")
-        .then(function(r) { return r.json(); })
-        .then(function(data) { renderUsageTable(Array.isArray(data) ? data : []); })
-        .catch(function() {
-          if (usageWrap) usageWrap.innerHTML = '<div class="usage-loading">Failed to load usage data.</div>';
-        });
-    }
-
-    fetchUsage();
-    setInterval(fetchUsage, 60_000);`;
+    }, 1000);`;

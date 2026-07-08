@@ -11,7 +11,7 @@
     <img src="https://img.shields.io/github/stars/moazbuilds/ClaudeClaw?style=flat-square&color=f59e0b" alt="GitHub Stars" />
   </a>
   <a href="https://github.com/moazbuilds/ClaudeClaw">
-    <img src="https://img.shields.io/static/v1?label=downloads&message=~15k%20every%2014%20days&color=2da44e&style=flat-square" alt="Downloads ~15k every 14 days" />
+    <img src="https://img.shields.io/badge/downloads-~10k-2da44e?style=flat-square" alt="Downloads ~10k" />
   </a>
   <a href="https://github.com/moazbuilds/ClaudeClaw/commits/master">
     <img src="https://img.shields.io/github/last-commit/moazbuilds/ClaudeClaw?style=flat-square&color=0ea5e9" alt="Last Commit" />
@@ -26,7 +26,7 @@
 
 <p align="center"><b>A lightweight, open-source OpenClaw version built into your Claude Code.</b></p>
 
-ClaudeClaw turns your Claude Code into a personal assistant that never sleeps. It runs as a background daemon, executing tasks on a schedule, responding to messages on Telegram, Discord, and Slack, transcribing voice commands, and integrating with any service you need.
+ClaudeClaw turns your Claude Code into a personal assistant that never sleeps. It runs as a background daemon, executing tasks on a schedule, responding to messages on Telegram and Discord, transcribing voice commands, and integrating with any service you need.
 
 > Note: Please don't use ClaudeClaw for hacking any bank system or doing any illegal activities. Thank you.
 
@@ -55,57 +55,7 @@ Then open a Claude Code session and run:
 ```
 /claudeclaw:start
 ```
-The setup wizard walks you through model, heartbeat, Telegram, Discord, Slack, and security, then your daemon is live with a web dashboard.
-
-### Contributor Note: Plugin Version Metadata
-
-If you change shipped plugin files under `src/`, `commands/`, `prompts/`, or `.claude-plugin/`, the plugin metadata version may also need to be bumped so Claude Code and marketplace consumers detect the update correctly.
-
-Helpers:
-
-```bash
-bun run bump:plugin-version
-bun run bump:marketplace-version
-```
-
-Docs-only and other non-shipped changes do not require these bumps.
-
-## Upgrading
-
-### v1.0.26 — Allowlist behavior change (Telegram & Discord)
-
-Prior to this release, an empty `allowedUserIds` list meant **allow everyone**. That was a potential security vulnerability; any Telegram or Discord user could drive the daemon.
-
-**New behavior:** an empty list means **block everyone**. The daemon will refuse to start if a bot token is configured without at least one allowed user ID.
-
-**Migration:** add your user ID(s) to `settings.json` before upgrading:
-
-```json
-"telegram": { "allowedUserIds": [123456789] },
-"discord":  { "allowedUserIds": ["987654321012345678"] }
-```
-
-Run `claudeclaw config` for guided setup if you're unsure of your user ID.
-
-### v1.1.0 — Web UI bearer token gate
-
-All `/api/*` routes (except `/api/health`) now require an `Authorization: Bearer <token>` header. The token is auto-generated on first start and written to `.claude/claudeclaw/web.token`. The daemon also prints the full URL with the token embedded when the web UI starts.
-
-**Migration:** update any scripts that call `/api/state` or other API routes to pass the token:
-
-```
-Authorization: Bearer <contents of .claude/claudeclaw/web.token>
-```
-
-Existing `/api/inject` users who configured `settings.apiToken` are unaffected; that fallback still works.
-
-### v1.1.0 — Discord text-attachment truncation limit reduced
-
-Text attachments sent to the Discord bot are now truncated at **2,048 bytes** (previously 51,200). Payloads over that limit have `…[truncated]` appended silently; there is no config knob to restore the old limit.
-
-**Migration:** if you rely on passing large text files through Discord attachments, switch to gists or another file-sharing mechanism and paste the URL instead.
-
----
+The setup wizard walks you through model, heartbeat, Telegram, Discord, and security, then your daemon is live with a web dashboard.
 
 ## What Would Be Built Next?
 
@@ -127,7 +77,6 @@ Text attachments sent to the Discord bot are now truncated at **2,048 bytes** (p
 ### Communication
 - **Telegram:** Text, image, and voice support.
 - **Discord:** DMs, server mentions/replies, slash commands, voice messages, and image attachments.
-- **Slack:** Socket Mode bot — DMs, channel mentions, threads, voice messages, and file attachments. Configure `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in your environment or `settings.json`.
 - **Time Awareness:** Message time prefixes help the agent understand delays and daily patterns.
 
 ### Multi-Session Threads (Discord)
@@ -151,7 +100,7 @@ See [docs/MULTI_SESSION.md](docs/MULTI_SESSION.md) for technical details.
   <summary><strong>Can ClaudeClaw do &lt;something&gt;?</strong></summary>
   <p>
     If Claude Code can do it, ClaudeClaw can do it too. ClaudeClaw adds cron jobs,
-    heartbeats, and Telegram/Discord/Slack bridges on top. You can also give your ClaudeClaw new
+    heartbeats, and Telegram/Discord bridges on top. You can also give your ClaudeClaw new
     skills and teach it custom workflows.
   </p>
 </details>

@@ -1,19 +1,13 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
-import { wrapUntrusted } from "../prompt-safety";
-import { isAllowed } from "../allowlist";
-import { extractErrorDetail } from "../messaging";
-import { loadPendingResume } from "../pending-resume";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
 import { getSettings, loadSettings } from "../config";
-import { transcribeAudioToText } from "../whisper";
-import { resetSession, resetFallbackSession, peekSession } from "../sessions";
-import { peekThreadSession, removeThreadSession } from "../sessionManager";
-import { existsSync } from "node:fs";
+import { resetSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
-import { findSessionJsonlPath } from "../sessionFiles";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
-import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
 
@@ -97,10 +91,6 @@ interface TelegramMessage {
   document?: TelegramDocument;
   voice?: TelegramVoice;
   audio?: TelegramAudio;
-  video?: TelegramVideo;
-  animation?: TelegramAnimation;
-  sticker?: TelegramSticker;
-  video_note?: TelegramVideoNote;
   entities?: Array<{
     type: "mention" | "bot_command" | string;
     offset: number;
@@ -124,44 +114,6 @@ interface TelegramDocument {
   file_id: string;
   file_name?: string;
   mime_type?: string;
-  file_size?: number;
-}
-
-interface TelegramVideo {
-  file_id: string;
-  file_name?: string;
-  mime_type?: string;
-  duration?: number;
-  width?: number;
-  height?: number;
-  file_size?: number;
-}
-
-// GIFs and silent looping videos. Telegram delivers these as mp4.
-interface TelegramAnimation {
-  file_id: string;
-  file_name?: string;
-  mime_type?: string;
-  duration?: number;
-  width?: number;
-  height?: number;
-  file_size?: number;
-}
-
-// Static stickers are .webp, animated are .tgs (lottie), video are .webm.
-interface TelegramSticker {
-  file_id: string;
-  emoji?: string;
-  is_animated?: boolean;
-  is_video?: boolean;
-  file_size?: number;
-}
-
-// Round video messages — always mp4, no filename/mime from Telegram.
-interface TelegramVideoNote {
-  file_id: string;
-  duration?: number;
-  length?: number;
   file_size?: number;
 }
 
@@ -251,77 +203,31 @@ function getMessageTextAndEntities(message: TelegramMessage): {
   return { text: "", entities: [] };
 }
 
-export function isImageDocument(document?: TelegramDocument): boolean {
+function isImageDocument(document?: TelegramDocument): boolean {
   return Boolean(document?.mime_type?.startsWith("image/"));
 }
 
-export function isAudioDocument(document?: TelegramDocument): boolean {
+function isAudioDocument(document?: TelegramDocument): boolean {
   return Boolean(document?.mime_type?.startsWith("audio/"));
 }
 
-// Accept any file sent as a document. Images and audio are routed to their
-// dedicated paths (image inspection / voice transcription); everything else —
-// regardless of mime type, including a missing one — is handed to Claude as a
-// file on disk to read and process.
-export function isDocumentAttachment(document?: TelegramDocument): boolean {
-  if (!document) return false;
+const DOCUMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/msword",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-powerpoint",
+  "text/plain",
+  "text/csv",
+  "text/markdown",
+]);
+
+function isDocumentAttachment(document?: TelegramDocument): boolean {
+  if (!document?.mime_type) return false;
   if (isImageDocument(document) || isAudioDocument(document)) return false;
-  return true;
-}
-
-export type MediaKind = "video" | "animation" | "sticker" | "video_note";
-
-export interface MediaAttachment {
-  file_id: string;
-  fileName: string;
-  mimeType?: string;
-  kind: MediaKind;
-}
-
-// Normalizes the first present gallery-media field (video/animation/sticker/
-// video_note) into a common shape with a sensible fallback filename+extension.
-// These arrive in dedicated Telegram fields, not `document`.
-export function pickMediaAttachment(message: TelegramMessage): MediaAttachment | null {
-  if (message.video) {
-    const v = message.video;
-    return {
-      file_id: v.file_id,
-      fileName: v.file_name ?? `video${extFromMime(v.mime_type, ".mp4")}`,
-      mimeType: v.mime_type,
-      kind: "video",
-    };
-  }
-  if (message.animation) {
-    const a = message.animation;
-    return {
-      file_id: a.file_id,
-      fileName: a.file_name ?? `animation${extFromMime(a.mime_type, ".mp4")}`,
-      mimeType: a.mime_type,
-      kind: "animation",
-    };
-  }
-  if (message.sticker) {
-    const s = message.sticker;
-    const ext = s.is_video ? ".webm" : s.is_animated ? ".tgs" : ".webp";
-    return { file_id: s.file_id, fileName: `sticker${ext}`, kind: "sticker" };
-  }
-  if (message.video_note) {
-    return { file_id: message.video_note.file_id, fileName: "video_note.mp4", kind: "video_note" };
-  }
-  return null;
-}
-
-function extFromMime(mimeType: string | undefined, fallback: string): string {
-  switch (mimeType) {
-    case "video/mp4":
-      return ".mp4";
-    case "video/webm":
-      return ".webm";
-    case "video/quicktime":
-      return ".mov";
-    default:
-      return fallback;
-  }
+  return DOCUMENT_MIME_TYPES.has(document.mime_type);
 }
 
 function pickLargestPhoto(photo: TelegramPhotoSize[]): TelegramPhotoSize {
@@ -381,14 +287,10 @@ function extractTelegramCommand(text: string): string | null {
 }
 
 async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
-  // Add 15s buffer on top of Telegram's own long-poll timeout (default 30s)
-  const telegramTimeout = (body?.timeout as number | undefined) ?? 0;
-  const httpTimeout = Math.max(30_000, (telegramTimeout + 15) * 1000);
   const res = await fetch(`${API_BASE}${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
     throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
@@ -396,17 +298,27 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
   return (await res.json()) as T;
 }
 
-async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
+async function sendMessage(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+  replyMarkup?: Record<string, unknown>,
+): Promise<void> {
   const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
   const html = markdownToTelegramHtml(normalized);
   const MAX_LEN = 4096;
-  for (let i = 0; i < html.length; i += MAX_LEN) {
+  // Attach reply_markup only to the final chunk so the buttons render under the last message
+  const totalChunks = Math.max(1, Math.ceil(html.length / MAX_LEN));
+  for (let idx = 0, i = 0; i < html.length; i += MAX_LEN, idx++) {
+    const isLast = idx === totalChunks - 1;
     try {
       await callApi(token, "sendMessage", {
         chat_id: chatId,
         text: html.slice(i, i + MAX_LEN),
         parse_mode: "HTML",
         ...(threadId ? { message_thread_id: threadId } : {}),
+        ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
     } catch {
       // Fallback to plain text if HTML parsing fails
@@ -414,9 +326,31 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
         chat_id: chatId,
         text: normalized.slice(i, i + MAX_LEN),
         ...(threadId ? { message_thread_id: threadId } : {}),
+        ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
     }
   }
+}
+
+async function sendApprovalMessage(
+  token: string,
+  chatId: number,
+  request: { id: string; toolName: string; description: string },
+): Promise<void> {
+  const text = [
+    "🔐 **Approval requested**",
+    "",
+    `**Tool:** ${request.toolName}`,
+    `**Action:** \`${request.description}\``,
+  ].join("\n");
+  const keyboard = {
+    inline_keyboard: [[
+      { text: "✅ Approve", callback_data: `apr_yes_${request.id}` },
+      { text: "❌ Deny", callback_data: `apr_no_${request.id}` },
+      { text: "♾️ Always", callback_data: `apr_always_${request.id}` },
+    ]],
+  };
+  await sendMessage(token, chatId, text, undefined, keyboard);
 }
 
 async function sendTyping(token: string, chatId: number, threadId?: number): Promise<void> {
@@ -455,134 +389,6 @@ async function sendDocumentToChat(
   }
 }
 
-// Chat IDs with verbose tool display enabled
-const verboseChats = new Set<number>();
-
-// Model overrides per chat ID
-const chatModels = new Map<number, string>();
-const MODEL_HAIKU = "claude-haiku-4-5-20251001";
-const MODEL_SONNET = "claude-sonnet-4-6";
-const MODEL_OPUS = "claude-opus-4-7";
-
-/**
- * Build a streaming callback using editMessageText.
- * On first chunk: send a placeholder message to get message_id.
- * On subsequent chunks (throttled): edit that message with accumulated plain text.
- * In verbose mode, tool call/result lines appear above the text response.
- */
-function makeStreamCallback(
-  token: string,
-  chatId: number,
-  threadId: number | undefined,
-  options: { intervalMs?: number; verbose?: boolean } = {}
-): { onChunk: (text: string) => void; onToolEvent: (line: string) => void; waitForStreamMsg: () => Promise<{ msgId: number | null; hadToolLines: boolean }> } {
-  const { intervalMs = 500, verbose = false } = options;
-  let textAcc = "";
-  const toolLines: string[] = [];
-  let lastSentAt = 0;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let streamMsgId: number | null = null;
-  let initPromise: Promise<void> | null = null;
-  let finalized = false;
-
-  const getDisplay = () => {
-    const MAX_TOOL_LINES = 8;
-    const MAX_TEXT_LINES = 15;
-    let toolPart: string;
-    if (toolLines.length > MAX_TOOL_LINES) {
-      const shown = toolLines.slice(-MAX_TOOL_LINES);
-      toolPart = `[...${toolLines.length - MAX_TOOL_LINES} earlier]\n` + shown.join("\n");
-    } else {
-      toolPart = toolLines.join("\n");
-    }
-    let textPart = textAcc;
-    const textLines = textPart.split("\n");
-    if (textLines.length > MAX_TEXT_LINES) {
-      textPart = `[...]\n` + textLines.slice(-MAX_TEXT_LINES).join("\n");
-    }
-    return toolPart + (textPart ? (toolPart ? "\n\n" : "") + textPart : "");
-  };
-
-  const editStream = () => {
-    if (!streamMsgId || finalized) return;
-    let display: string;
-    if (verbose) {
-      display = getDisplay();
-    } else {
-      // Keep last N lines of text for streaming preview
-      const lines = textAcc.split("\n");
-      display = lines.length > 30 ? `[...]\n${lines.slice(-30).join("\n")}` : textAcc;
-    }
-    if (!display) return;
-    callApi(token, "editMessageText", {
-      chat_id: chatId,
-      message_id: streamMsgId,
-      text: display.slice(0, 4096),
-    }).catch(() => {});
-  };
-
-  const flush = async () => {
-    const display = verbose ? getDisplay() : textAcc;
-    if (!display) return;
-    lastSentAt = Date.now();
-
-    if (!streamMsgId && !initPromise) {
-      initPromise = (async () => {
-        try {
-          const res = await callApi<{ ok: boolean; result: { message_id: number } }>(
-            token, "sendMessage", {
-              chat_id: chatId,
-              text: "⏳",
-              ...(threadId ? { message_thread_id: threadId } : {}),
-            }
-          );
-          if (res.ok) {
-            streamMsgId = res.result.message_id;
-            editStream();
-          }
-        } catch {}
-      })();
-      await initPromise;
-    } else {
-      if (initPromise) await initPromise;
-      editStream();
-    }
-  };
-
-  const onChunk = (text: string) => {
-    textAcc += text;
-    const now = Date.now();
-    if (now - lastSentAt >= intervalMs) {
-      if (timer) { clearTimeout(timer); timer = null; }
-      flush();
-    } else if (!timer) {
-      timer = setTimeout(() => { timer = null; flush(); }, intervalMs - (now - lastSentAt));
-    }
-  };
-
-  const onToolEvent = (line: string) => {
-    if (!verbose) return;
-    toolLines.push(line);
-    // Use same throttle logic as onChunk to avoid spamming the API
-    const now = Date.now();
-    if (now - lastSentAt >= intervalMs) {
-      if (timer) { clearTimeout(timer); timer = null; }
-      flush();
-    } else if (!timer) {
-      timer = setTimeout(() => { timer = null; flush(); }, intervalMs - (now - lastSentAt));
-    }
-  };
-
-  const waitForStreamMsg = async (): Promise<{ msgId: number | null; hadToolLines: boolean }> => {
-    if (timer) { clearTimeout(timer); timer = null; }
-    if (initPromise) await initPromise;
-    finalized = true;
-    return { msgId: streamMsgId, hadToolLines: toolLines.length > 0 };
-  };
-
-  return { onChunk, onToolEvent, waitForStreamMsg };
-}
-
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
   let reactionEmoji: string | null = null;
   const cleanedText = text
@@ -614,157 +420,12 @@ function extractSendFileDirectives(text: string): {
   return { cleanedText, filePaths };
 }
 
-const VOICE_DIRECTIVE_RE = /\[voice:(\/[^\]\r\n]+)\]/gi;
-
-function extractVoiceDirectives(text: string): { cleanedText: string; voicePaths: string[] } {
-  const voicePaths: string[] = [];
-  const cleanedText = text
-    .replace(VOICE_DIRECTIVE_RE, (_match, path) => {
-      const p = String(path).trim();
-      if (p && existsSync(p)) voicePaths.push(p);
-      return "";
-    })
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return { cleanedText, voicePaths };
-}
-
-async function sendVoiceMessage(token: string, chatId: number, voicePath: string, threadId?: number): Promise<void> {
-  const form = new FormData();
-  form.append("chat_id", String(chatId));
-  if (threadId) form.append("message_thread_id", String(threadId));
-
-  const file = Bun.file(voicePath);
-  form.append("voice", file, voicePath.split("/").pop() ?? "voice.ogg");
-
-  const res = await fetch(`${API_BASE}${token}/sendVoice`, {
-    method: "POST",
-    body: form,
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Telegram sendVoice: ${res.status} ${res.statusText} — ${body}`);
-  }
-}
-
 async function sendReaction(token: string, chatId: number, messageId: number, emoji: string): Promise<void> {
   await callApi(token, "setMessageReaction", {
     chat_id: chatId,
     message_id: messageId,
     reaction: [{ type: "emoji", emoji }],
   });
-}
-
-// --- Inline buttons support ---
-
-/**
- * Parse [buttons: Label A | Label B \n Label C | Label D] directives from Claude output.
- * Each line of the directive becomes a row; pipes split buttons within a row.
- * Returns button rows and the cleaned text with the directive removed.
- */
-function extractButtonsDirective(text: string): { cleanedText: string; buttonRows: string[][] | null } {
-  let buttonRows: string[][] | null = null;
-  const cleanedText = text
-    .replace(/\[buttons:([^\]]+)\]/gi, (_match, raw) => {
-      const rows = String(raw)
-        .trim()
-        .split(/\r?\n/)
-        .map((row) => row.split("|").map((label) => label.trim()).filter(Boolean))
-        .filter((row) => row.length > 0);
-      if (rows.length > 0) buttonRows = rows;
-      return "";
-    })
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return { cleanedText, buttonRows };
-}
-
-// Map short button IDs to labels for callback routing (in-memory, per-process).
-// IDs are never recycled within a process lifetime — the counter is strictly monotonic.
-// Entries carry a creation timestamp so we can evict stale ones; otherwise a long-running
-// daemon would accumulate every button label ever generated and leak memory unbounded.
-type ButtonEntry = { label: string; createdAt: number };
-const buttonLabelMap = new Map<string, ButtonEntry>();
-let _buttonCounter = 0;
-const BUTTON_TTL_MS = 24 * 60 * 60 * 1000; // 24h is well past any reasonable user dwell
-const BUTTON_MAX_ENTRIES = 5000; // hard cap as a safety net for flood scenarios
-
-function pruneExpiredButtons(now: number = Date.now()): void {
-  for (const [id, entry] of buttonLabelMap) {
-    if (now - entry.createdAt > BUTTON_TTL_MS) {
-      buttonLabelMap.delete(id);
-    }
-  }
-  // Hard cap defense: if a flood fills the map within TTL, drop oldest insertions
-  // (Map preserves insertion order) until back under the cap.
-  if (buttonLabelMap.size > BUTTON_MAX_ENTRIES) {
-    const overflow = buttonLabelMap.size - BUTTON_MAX_ENTRIES;
-    let dropped = 0;
-    for (const id of buttonLabelMap.keys()) {
-      if (dropped >= overflow) break;
-      buttonLabelMap.delete(id);
-      dropped++;
-    }
-  }
-}
-
-function getButtonLabel(btnId: string): string | undefined {
-  const entry = buttonLabelMap.get(btnId);
-  if (!entry) return undefined;
-  if (Date.now() - entry.createdAt > BUTTON_TTL_MS) {
-    buttonLabelMap.delete(btnId);
-    return undefined;
-  }
-  return entry.label;
-}
-
-function makeButtonId(label: string): string {
-  // Per-button counter guarantees uniqueness within a process lifetime.
-  const id = `b${_buttonCounter++}`;
-  buttonLabelMap.set(id, { label, createdAt: Date.now() });
-  // Opportunistic eviction every 100 buttons — cheap O(n) sweep without a separate timer.
-  if (_buttonCounter % 100 === 0) pruneExpiredButtons();
-  return `btn:${id}`;
-}
-
-async function sendMessageWithButtons(
-  token: string,
-  chatId: number,
-  text: string,
-  buttonRows: string[][],
-  threadId?: number
-): Promise<void> {
-  const body = text.trim() || "\u200B"; // zero-width space when text is empty (buttons-only)
-  const normalized = normalizeTelegramText(body).replace(/\[react:[^\]\r\n]+\]/gi, "");
-  const html = markdownToTelegramHtml(normalized);
-  const inline_keyboard = buttonRows.map((row) =>
-    row.map((label) => ({ text: label, callback_data: makeButtonId(label) }))
-  );
-  const MAX_LEN = 4096;
-  // Send all chunks except the last without buttons; attach buttons only to the final chunk.
-  for (let i = 0; i < html.length; i += MAX_LEN) {
-    const isLast = i + MAX_LEN >= html.length;
-    const replyMarkup = isLast ? { inline_keyboard } : undefined;
-    try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
-      // Fallback to plain text if HTML parse fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    }
-  }
 }
 
 let botUsername: string | null = null;
@@ -789,9 +450,6 @@ function groupTriggerReason(message: TelegramMessage): string | null {
       if (botUsername && value.toLowerCase().endsWith(`@${botUsername.toLowerCase()}`)) return "scoped_command_matches_bot";
     }
   }
-
-  const { telegram } = getSettings();
-  if (telegram.listenChats?.includes(message.chat.id)) return "listen_chat";
 
   return null;
 }
@@ -901,38 +559,6 @@ async function downloadDocumentFromMessage(
   return { localPath, originalName };
 }
 
-async function downloadMediaFromMessage(
-  token: string,
-  message: TelegramMessage
-): Promise<{ localPath: string; originalName: string; kind: MediaKind } | null> {
-  const media = pickMediaAttachment(message);
-  if (!media) return null;
-
-  const fileMeta = await callApi<{ ok: boolean; result: TelegramFile }>(
-    token,
-    "getFile",
-    { file_id: media.file_id }
-  );
-  if (!fileMeta.ok || !fileMeta.result.file_path) return null;
-
-  const remotePath = fileMeta.result.file_path;
-  const downloadUrl = `${FILE_API_BASE}${token}/${remotePath}`;
-  const response = await fetch(downloadUrl);
-  if (!response.ok) {
-    throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);
-  }
-
-  const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "telegram");
-  await mkdir(dir, { recursive: true });
-
-  const ext = extname(media.fileName) || extname(remotePath) || "";
-  const filename = `${message.chat.id}-${message.message_id}-${Date.now()}${ext}`;
-  const localPath = join(dir, filename);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  await Bun.write(localPath, bytes);
-  return { localPath, originalName: media.fileName, kind: media.kind };
-}
-
 async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<void> {
   const config = getSettings().telegram;
   const chat = update.chat;
@@ -946,22 +572,15 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
 
   if (!isGroup || !wasOut || !isIn) return;
 
-  const adderId = update.from.id;
-  if (!isAllowed(adderId, config.allowedUserIds)) {
-    console.log(`[Telegram] Unauthorized add to ${chat.id} by ${adderId}; leaving.`);
-    await callApi(config.token, "leaveChat", { chat_id: chat.id }).catch(() => {});
-    return;
-  }
-
   const chatName = chat.title ?? String(chat.id);
   console.log(`[Telegram] Added to ${chat.type}: ${chatName} (${chat.id}) by ${update.from.id}`);
 
   const addedBy = update.from.username ?? `${update.from.first_name} (${update.from.id})`;
   const eventPrompt =
     `[Telegram system event] I was added to a ${chat.type}.\n` +
-    `Group title: ${wrapUntrusted("group-title", chatName)}\n` +
+    `Group title: ${chatName}\n` +
     `Group id: ${chat.id}\n` +
-    `Added by: ${wrapUntrusted("adder-username", addedBy)}\n` +
+    `Added by: ${addedBy}\n` +
     "Write a short first message for the group. It should confirm I was added and explain how to trigger me.";
 
   try {
@@ -975,21 +594,6 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
     console.error(`[Telegram] group-added event error: ${err instanceof Error ? err.message : err}`);
     await sendMessage(config.token, chat.id, "I was added to this group. Mention me with a command to start.");
   }
-}
-
-function getTelegramSessionKey(
-  chatId: number,
-  threadId: number | undefined,
-  userId: number | undefined,
-  isPrivate: boolean,
-  dmIsolation: "shared" | "perUser",
-): string | undefined {
-  if (isPrivate) {
-    if (dmIsolation === "perUser" && userId !== undefined) return `tg:dm:${userId}`;
-    return undefined;
-  }
-  if (threadId !== undefined) return `tg:${chatId}:${threadId}`;
-  return `tg:${chatId}`;
 }
 
 // --- Message handler ---
@@ -1006,8 +610,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   const hasImage = Boolean((message.photo && message.photo.length > 0) || isImageDocument(message.document));
   const hasVoice = Boolean(message.voice || message.audio || isAudioDocument(message.document));
   const hasDocument = Boolean(message.document && isDocumentAttachment(message.document));
-  const hasMedia = Boolean(message.video || message.animation || message.sticker || message.video_note);
-  const sessionKey = getTelegramSessionKey(chatId, threadId, userId, isPrivate, config.dmIsolation);
 
   if (!isPrivate && !isGroup) return;
 
@@ -1022,17 +624,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     `Handle message chat=${chatId} type=${chatType} from=${userId ?? "unknown"} reason=${triggerReason} text="${(text ?? "").slice(0, 80)}"`
   );
 
-  if (!isAllowed(userId, config.allowedUserIds)) {
+  if (userId && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
     if (isPrivate) {
       await sendMessage(config.token, chatId, "Unauthorized.");
     } else {
-      console.log(`[Telegram] Ignored group message from unauthorized user ${userId ?? "unknown"} in chat ${chatId}`);
-      debugLog(`Skip group message chat=${chatId} from=${userId ?? "unknown"} reason=unauthorized_user`);
+      console.log(`[Telegram] Ignored group message from unauthorized user ${userId} in chat ${chatId}`);
+      debugLog(`Skip group message chat=${chatId} from=${userId} reason=unauthorized_user`);
     }
     return;
   }
 
-  if (!text.trim() && !hasImage && !hasVoice && !hasDocument && !hasMedia) {
+  if (!text.trim() && !hasImage && !hasVoice && !hasDocument) {
     debugLog(`Skip message chat=${chatId} from=${userId ?? "unknown"} reason=empty_text`);
     return;
   }
@@ -1049,29 +651,20 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/reset") {
-    if (sessionKey) {
-      await removeThreadSession(sessionKey);
-      await resetFallbackSession(undefined, sessionKey);
-      await sendMessage(config.token, chatId, "Session reset. Next message starts fresh.", threadId);
-    } else {
-      await resetSession();
-      await resetFallbackSession();
-      await sendMessage(config.token, chatId, "Global session reset. Next message starts fresh.", threadId);
-    }
+    await resetSession();
+    await sendMessage(config.token, chatId, "Global session reset. Next message starts fresh.", threadId);
     return;
   }
 
   if (command === "/compact") {
     await sendMessage(config.token, chatId, "⏳ Compacting session...", threadId);
-    const result = sessionKey
-      ? await compactCurrentThreadSession(sessionKey)
-      : await compactCurrentSession();
+    const result = await compactCurrentSession();
     await sendMessage(config.token, chatId, result.message, threadId);
     return;
   }
 
   if (command === "/status") {
-    const session = sessionKey ? await peekThreadSession(sessionKey) : await peekSession();
+    const session = await peekSession();
     const settings = getSettings();
     if (!session) {
       await sendMessage(config.token, chatId, "📊 No active session.", threadId);
@@ -1092,13 +685,15 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/context") {
-    const session = sessionKey ? await peekThreadSession(sessionKey) : await peekSession();
+    const session = await peekSession();
     if (!session) {
       await sendMessage(config.token, chatId, "No active session.", threadId);
       return;
     }
-    const jsonlPath = findSessionJsonlPath(session.sessionId);
-    if (!jsonlPath) {
+    const home = homedir();
+    const projectSlug = process.cwd().replace(/\//g, "-");
+    const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
+    if (!existsSync(jsonlPath)) {
       await sendMessage(config.token, chatId, "Conversation file not found.", threadId);
       return;
     }
@@ -1144,130 +739,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-  if (command === "/kill") {
-    const killed = killActive();
-    await sendMessage(config.token, chatId, killed ? "Killed active agent." : "No active agent running.", threadId);
-    return;
-  }
-
-  if (command === "/verbose") {
-    if (verboseChats.has(chatId)) {
-      verboseChats.delete(chatId);
-      await sendMessage(config.token, chatId, "Verbose mode off.", threadId);
-    } else {
-      verboseChats.add(chatId);
-      await sendMessage(config.token, chatId, "Verbose mode on — tool calls will be shown.", threadId);
-    }
-    return;
-  }
-
-  if (command === "/model") {
-    const currentModel = chatModels.get(chatId);
-    const settings = getSettings();
-    const defaultModel = settings.model || "default";
-    if (!currentModel) {
-      await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced (default)\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default`, threadId);
-    } else {
-      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel;
-      await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default (${defaultModel})`, threadId);
-    }
-    return;
-  }
-
-  if (command === "/modelhaiku") {
-    chatModels.set(chatId, MODEL_HAIKU);
-    await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable.", threadId);
-    return;
-  }
-
-  if (command === "/modelsonnet") {
-    chatModels.set(chatId, MODEL_SONNET);
-    await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability.", threadId);
-    return;
-  }
-
-  if (command === "/modelopus") {
-    chatModels.set(chatId, MODEL_OPUS);
-    await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses.", threadId);
-    return;
-  }
-
-  if (command === "/modeldefault") {
-    chatModels.delete(chatId);
-    const settings = getSettings();
-    const defaultModel = settings.model || "default";
-    await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel}`, threadId);
-    return;
-  }
-
-  if (command === "/fork") {
-    const forkPrompt = text.replace(/^\/fork\s*/i, "").trim();
-    if (!forkPrompt) {
-      await sendMessage(config.token, chatId, "Usage: /fork <prompt>", threadId);
-      return;
-    }
-    const typingInterval = setInterval(() => sendTyping(config.token, chatId, threadId), 4000);
-    try {
-      await sendTyping(config.token, chatId, threadId);
-      const senderLabel = message.from?.username ?? String(userId ?? "unknown");
-      const result = await runFork(`[Telegram from ${senderLabel}]\nMessage: ${forkPrompt}`);
-      if (result.exitCode !== 0) {
-        await sendMessage(config.token, chatId, `Fork error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
-      } else {
-        await sendMessage(config.token, chatId, result.stdout || "(empty response)", threadId);
-      }
-    } catch (err) {
-      await sendMessage(config.token, chatId, `Fork error: ${err instanceof Error ? err.message : String(err)}`, threadId);
-    } finally {
-      clearInterval(typingInterval);
-    }
-    return;
-  }
-
-  if (command === "/mode") {
-    const arg = text.trim().slice("/mode".length).trim().toLowerCase();
-    const modeMap: Record<string, PermissionMode> = {
-      plan: "plan",
-      edit: "acceptEdits",
-      unrestricted: "bypassPermissions",
-    };
-    const modeLabels: Record<PermissionMode, string> = {
-      plan: "plan",
-      acceptEdits: "edit",
-      bypassPermissions: "unrestricted",
-    };
-
-    if (!arg) {
-      const current = getPermissionMode();
-      await sendMessage(
-        config.token,
-        chatId,
-        [
-          `Current mode: **${modeLabels[current]}**`,
-          "",
-          "Available modes:",
-          "- /mode plan - read-only planning",
-          "- /mode edit - auto-accept file edits",
-          "- /mode unrestricted - full permissions, no prompts",
-        ].join("\n"),
-        threadId
-      );
-      return;
-    }
-
-    const mode = modeMap[arg];
-    if (!mode) {
-      const safeArg = arg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      await sendMessage(config.token, chatId, `Unknown mode: \`${safeArg}\`\n\nValid modes: plan, edit, unrestricted`, threadId);
-      return;
-    }
-
-    setPermissionMode(mode);
-    console.log(`[Telegram] Permission mode changed to ${modeLabels[mode]} by user ${userId ?? "unknown"}`);
-    await sendMessage(config.token, chatId, `Mode set to **${modeLabels[mode]}**. Takes effect on the next message.`, threadId);
-    return;
-  }
-
   // Secretary: detect reply to a bot alert message → treat as custom reply
   const replyToMsgId = message.reply_to_message?.message_id;
   if (replyToMsgId && text && botId && message.reply_to_message?.from?.id === botId) {
@@ -1297,22 +768,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     `[${new Date().toLocaleTimeString()}] Telegram ${label}${mediaSuffix}: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`
   );
 
-  // Plugin wizard: local control-plane logic — not subject to rate limiting
-  const wizardCtx = { iface: "telegram" as const, scopeId: String(chatId) };
-  if ((command && isWizardTrigger(command)) || hasActiveWizard(wizardCtx)) {
-    const reply = await handleWizardInput(wizardCtx, text.trim());
-    await sendMessage(config.token, chatId, reply, threadId);
-    return;
-  }
-
-  // If rate-limited, reply immediately without calling Claude
-  if (isRateLimited()) {
-    const resetAt = new Date(getRateLimitResetAt());
-    const resetStr = resetAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
-    await sendMessage(config.token, chatId, `Usage limit reached. Resets at ${resetStr} UTC. I'll be back after that.`, threadId);
-    return;
-  }
-
   // Keep typing indicator alive while queued/running
   const typingInterval = setInterval(() => sendTyping(config.token, chatId, threadId), 4000);
 
@@ -1336,21 +791,21 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
 
       if (voicePath) {
-        debugLog(`Voice file saved: path=${voicePath}`);
-        const { delegateTool } = getSettings().stt;
-        if (!delegateTool) {
-          try {
-            voiceTranscript = await transcribeAudioToText(voicePath);
-          } catch (err) {
-            console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
-          }
+        try {
+          debugLog(`Voice file saved: path=${voicePath}`);
+          voiceTranscript = await transcribeAudioToText(voicePath, {
+            debug: telegramDebug,
+            log: (message) => debugLog(message),
+          });
+        } catch (err) {
+          console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
         }
       }
     }
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork" && command !== "/mode") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1372,17 +827,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
     }
 
-    let mediaInfo: { localPath: string; originalName: string; kind: MediaKind } | null = null;
-    if (hasMedia) {
-      try {
-        mediaInfo = await downloadMediaFromMessage(config.token, message);
-      } catch (err) {
-        console.error(
-          `[Telegram] Failed to download media for ${label}: ${err instanceof Error ? err.message : err}`
-        );
-      }
-    }
-
     const promptParts = [`[Telegram from ${label}]`];
     if (threadId) promptParts.push(`[thread:${threadId}]`);
     if (skillContext) {
@@ -1390,9 +834,9 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       const args = text.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
       promptParts.push(skillContext);
-      if (args) promptParts.push(`User arguments: ${wrapUntrusted("skill-arguments", args)}`);
+      if (args) promptParts.push(`User arguments: ${args}`);
     } else if (text.trim()) {
-      promptParts.push(`Message: ${wrapUntrusted("user-message", text)}`);
+      promptParts.push(`Message: ${text}`);
     }
     if (imagePath) {
       promptParts.push(`Image path: ${imagePath}`);
@@ -1401,25 +845,16 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       promptParts.push("The user attached an image, but downloading it failed. Respond and ask them to resend.");
     }
     if (voiceTranscript) {
-      promptParts.push(`Voice transcript: ${wrapUntrusted("voice-transcript", voiceTranscript, 2000)}`);
-    } else if (voicePath) {
-      const { delegateTool } = getSettings().stt;
-      if (delegateTool) {
-        promptParts.push(`Voice file path: ${voicePath}`);
-        promptParts.push(`The user sent a voice message. Transcribe it by calling \`${delegateTool}\` with the file path above, then respond to the transcribed text as their spoken message.`);
-      } else {
-        promptParts.push(
-          "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
-        );
-      }
+      promptParts.push(`Voice transcript: ${voiceTranscript}`);
+      promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
     } else if (hasVoice) {
       promptParts.push(
-        "The user attached voice audio, but downloading it failed. Respond and ask them to resend."
+        "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
       );
     }
     if (documentInfo) {
       promptParts.push(`Document path: ${documentInfo.localPath}`);
-      promptParts.push(`Original filename: ${wrapUntrusted("attachment-filename", documentInfo.originalName)}`);
+      promptParts.push(`Original filename: ${documentInfo.originalName}`);
       promptParts.push(
         "The user attached a document. Read and process this file directly."
       );
@@ -1428,112 +863,20 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         "The user attached a document, but downloading it failed. Respond and ask them to resend."
       );
     }
-    if (mediaInfo) {
-      promptParts.push(`Media path: ${mediaInfo.localPath}`);
-      promptParts.push(`Original filename: ${wrapUntrusted("attachment-filename", mediaInfo.originalName)}`);
-      const mediaInstruction =
-        mediaInfo.kind === "sticker"
-          ? "The user sent a sticker (saved at the path above — may be .webp, .tgs, or .webm). Use available tools to inspect it if relevant."
-          : "The user sent a video. It's saved at the path above; use available tools (ffmpeg, frame extraction, etc.) to inspect, transcode, or pull frames as needed before responding.";
-      promptParts.push(mediaInstruction);
-    } else if (hasMedia) {
-      promptParts.push(
-        "The user attached video/sticker media, but downloading it failed (Telegram bots cannot fetch files over 20 MB). Respond and ask them to resend a smaller file or send it as a document."
-      );
-    }
     const prefixedPrompt = promptParts.join("\n");
-    const busy = isMainBusy();
-    const verbose = verboseChats.has(chatId);
-    const modelOverride = chatModels.get(chatId);
-    let result;
-    let streamMsgId: number | null = null;
-    let hadToolLines = false;
-    if (busy) {
-      await sendMessage(config.token, chatId, "Claude is busy — try again in a moment, or use /fork for a quick parallel task.", threadId);
-      return;
-    } else {
-      const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
-      const streamResult = await stream.waitForStreamMsg();
-      streamMsgId = streamResult.msgId;
-      hadToolLines = streamResult.hadToolLines;
-    }
+    const result = await runUserMessage("telegram", prefixedPrompt);
 
     if (result.exitCode !== 0) {
-      const isTimedOut = result.exitCode === 124;
-      const errorMsg = isTimedOut
-        ? `⏱ Request timed out — the subprocess took too long and was killed. Try again or split into smaller steps.`
-        : `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`;
-      if (streamMsgId) {
-        await callApi(config.token, "editMessageText", {
-          chat_id: chatId, message_id: streamMsgId, text: errorMsg,
-        }).catch(() => sendMessage(config.token, chatId, errorMsg, threadId));
-      } else {
-        await sendMessage(config.token, chatId, errorMsg, threadId);
-      }
+      await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
     } else {
       const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
-      const hadVoiceDirective = /\[voice:\/[^\]\r\n]+\]/i.test(afterReact);
-      const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
-      const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
-      const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
+      const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
       if (reactionEmoji) {
         await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      for (const vp of voicePaths) {
-        try {
-          await sendVoiceMessage(config.token, chatId, vp, threadId);
-          debugLog(`Voice sent: ${vp}`);
-        } catch (err) {
-          console.error(`[Telegram] Failed to send voice ${vp} for ${label}: ${err instanceof Error ? err.message : err}`);
-        }
-      }
-      // Whether the response is directive-only (attachment is the output, text is empty)
-      const isDirectiveOnly = !cleanedText && (buttonRows || filePaths.length > 0 || voicePaths.length > 0 || hadVoiceDirective);
-
-      if (buttonRows) {
-        // Delete the stream preview before sending the button message — the
-        // preview shows raw streaming text (or the raw [buttons:] directive)
-        // which would otherwise sit above the button message as a duplicate.
-        if (streamMsgId) {
-          await callApi(config.token, "deleteMessage", {
-            chat_id: chatId, message_id: streamMsgId,
-          }).catch(() => {});
-        }
-        await sendMessageWithButtons(config.token, chatId, cleanedText, buttonRows, threadId);
-      } else if (streamMsgId) {
-        if (isDirectiveOnly) {
-          // The attachment (file / voice) IS the response — delete the stream
-          // preview so the user doesn't see "(empty response)" as a stray message.
-          await callApi(config.token, "deleteMessage", {
-            chat_id: chatId, message_id: streamMsgId,
-          }).catch(() => {});
-        } else {
-          // Normal text response: edit stream with final formatted HTML.
-          // editStream() already set the message to the correct plain text, so if
-          // all edits fail ("message is not modified") do NOT send a new message —
-          // the user already sees the correct content and a sendMessage would duplicate.
-          const finalText = cleanedText || "(empty response)";
-          const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
-          await callApi(config.token, "editMessageText", {
-            chat_id: chatId, message_id: streamMsgId,
-            text: html.slice(0, 4096), parse_mode: "HTML",
-          }).catch(() => callApi(config.token, "editMessageText", {
-            chat_id: chatId, message_id: streamMsgId,
-            text: finalText.slice(0, 4096),
-          }).catch(() => {
-            // If all edits fail and the stream message has tool output (verbose),
-            // send the final response as a new message. But if there were no tool
-            // lines, the stream message already shows the correct text — "not
-            // modified" just means it's already right, so don't send a duplicate.
-            if (verbose && hadToolLines) {
-              return sendMessage(config.token, chatId, finalText, threadId);
-            }
-          }));
-        }
-      } else if (cleanedText) {
+      if (cleanedText && !cleanedText.trim().startsWith("HEARTBEAT_OK")) {
         await sendMessage(config.token, chatId, cleanedText, threadId);
       }
       for (const fp of filePaths) {
@@ -1544,7 +887,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           await sendMessage(config.token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
         }
       }
-      if (!cleanedText && !buttonRows && filePaths.length === 0 && voicePaths.length === 0 && !hadVoiceDirective && !streamMsgId) {
+      if (!cleanedText && filePaths.length === 0) {
         await sendMessage(config.token, chatId, "(empty response)", threadId);
       }
     }
@@ -1562,16 +905,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
   const config = getSettings().telegram;
   const data = query.data ?? "";
-
-  // Enforce allowlist on callback queries (same policy as regular messages)
-  const callbackUserId = query.from.id;
-  if (!isAllowed(callbackUserId, config.allowedUserIds)) {
-    await callApi(config.token, "answerCallbackQuery", {
-      callback_query_id: query.id,
-      text: "Unauthorized.",
-    }).catch(() => {});
-    return;
-  }
 
   // Secretary pattern: "sec_yes_<8hex>" or "sec_no_<8hex>"
   const secMatch = data.match(/^sec_(yes|no)_([0-9a-f]{8})$/);
@@ -1602,72 +935,53 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     return;
   }
 
-  // Generic inline button press (btn:<id> pattern from [buttons: ...] directive)
-  if (data.startsWith("btn:")) {
-    const btnId = data.slice(4);
-    const label = getButtonLabel(btnId);
-
-    // Reject unknown/expired IDs — don't fall back to treating the raw ID as a label.
-    // IDs are process-local; after a daemon restart old buttons are always expired.
-    if (!label) {
-      await callApi(config.token, "answerCallbackQuery", {
-        callback_query_id: query.id,
-        text: "This button has expired. Please continue the conversation.",
-        show_alert: true,
-      }).catch(() => {});
-      return;
+  // Approval pattern: "apr_(yes|no|always)_<uuid>" routed to ClaudeClaw's own /api/approval/resolve
+  const aprMatch = data.match(/^apr_(yes|no|always)_([0-9a-f-]{36})$/);
+  if (aprMatch) {
+    const action = aprMatch[1];
+    const approvalId = aprMatch[2];
+    const decision =
+      action === "yes" ? "approve" :
+      action === "always" ? "approve_always" :
+      "deny";
+    const webPort = getSettings().web.port;
+    let answerText = "⚠️ Server error";
+    let statusLine = "";
+    try {
+      const resp = await fetch(`http://127.0.0.1:${webPort}/api/approval/resolve/${approvalId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          decision,
+          reason: action === "no" ? "Denied from Telegram" : undefined,
+        }),
+      });
+      const result = await resp.json() as { ok?: boolean; resolved?: boolean };
+      if (result.resolved) {
+        answerText = decision === "deny" ? "❌ Denied" : decision === "approve_always" ? "♾️ Always" : "✅ Approved";
+        statusLine = `\n\n${answerText}`;
+      } else {
+        answerText = "⚠️ Already resolved or expired";
+        statusLine = "\n\n⚠️ Already settled";
+      }
+      if (query.message) {
+        const baseText = query.message.text ?? "";
+        const newText = baseText.replace(/\n\n(✅|❌|♾️|⚠️).*$/s, "") + statusLine;
+        await callApi(config.token, "editMessageText", {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          text: newText,
+          // Clear the inline keyboard now that the decision is made
+          reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+      }
+    } catch {
+      // web server unreachable
     }
-
-    // Ack immediately so Telegram stops showing the loading spinner
     await callApi(config.token, "answerCallbackQuery", {
       callback_query_id: query.id,
-      text: label,
+      text: answerText,
     }).catch(() => {});
-
-    // Free the entry as soon as it's been consumed; buttons are one-shot.
-    buttonLabelMap.delete(btnId);
-
-    // Edit original message to mark the selected button visually
-    if (query.message) {
-      const originalText = query.message.text ?? "";
-      await callApi(config.token, "editMessageText", {
-        chat_id: query.message.chat.id,
-        message_id: query.message.message_id,
-        text: `${originalText}\n\n› ${label}`,
-      }).catch(() => {});
-    }
-
-    // Inject button press as a new user message to the running Claude session
-    const chatId = query.message?.chat.id ?? query.from.id;
-    const threadId = query.message?.message_thread_id;
-    try {
-      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`);
-      if (result.exitCode === 0 && result.stdout) {
-        const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout);
-        const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
-        const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
-        const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
-        if (reactionEmoji && query.message) {
-          await sendReaction(config.token, chatId, query.message.message_id, reactionEmoji).catch(() => {});
-        }
-        for (const vp of voicePaths) {
-          await sendVoiceMessage(config.token, chatId, vp, threadId).catch(() => {});
-        }
-        if (buttonRows) {
-          await sendMessageWithButtons(config.token, chatId, cleanedText, buttonRows, threadId);
-        } else if (cleanedText) {
-          await sendMessage(config.token, chatId, cleanedText, threadId);
-        }
-        for (const fp of filePaths) {
-          await sendDocumentToChat(config.token, chatId, fp, threadId).catch(() => {});
-        }
-      } else if (result.exitCode !== 0) {
-        await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      await sendMessage(config.token, chatId, `Error: ${errMsg}`, threadId);
-    }
     return;
   }
 
@@ -1681,24 +995,11 @@ async function registerBotCommands(token: string): Promise<void> {
   try {
     const skills = await listSkills();
     const commands = [
-      // Session management
-      { command: "start", description: "👋 Welcome message" },
-      { command: "status", description: "📊 Session info and stats" },
-      { command: "context", description: "📐 Context window usage" },
-      { command: "reset", description: "🔄 Start fresh session" },
-      { command: "compact", description: "🗜️ Reduce context size" },
-      // Model selection
-      { command: "model", description: "📊 Show current model and options" },
-      { command: "modelhaiku", description: "⚡ Switch to Haiku (fastest)" },
-      { command: "modelsonnet", description: "⚖️ Switch to Sonnet (balanced)" },
-      { command: "modelopus", description: "🧠 Switch to Opus (most capable)" },
-      { command: "modeldefault", description: "🔄 Reset to config default model" },
-      // Mode toggles
-      { command: "mode", description: "🔐 Get or set Claude permission mode" },
-      { command: "verbose", description: "🔧 Toggle tool call display" },
-      // Control
-      { command: "fork", description: "🍴 Run parallel task" },
-      { command: "kill", description: "⛔ Stop current agent" },
+      { command: "start", description: "Show welcome message" },
+      { command: "reset", description: "Reset session and start fresh" },
+      { command: "compact", description: "Compact session to reduce context size" },
+      { command: "status", description: "Show current session status" },
+      { command: "context", description: "Show context window usage" },
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
@@ -1721,7 +1022,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
@@ -1733,14 +1034,8 @@ async function registerBotCommands(token: string): Promise<void> {
 // --- Polling loop ---
 
 let running = true;
-let isPolling = false;
-// Monotonically increasing counter. Each startPolling() call captures the
-// value at the time it starts. The poll loop checks it after every await so
-// a stale loop exits cleanly when stopPolling() or a subsequent startPolling()
-// increments the counter, even if a long-poll request is still in flight.
-let pollingGeneration = 0;
 
-async function poll(generation: number): Promise<void> {
+async function poll(): Promise<void> {
   const config = getSettings().telegram;
   let offset = 0;
   try {
@@ -1756,22 +1051,19 @@ async function poll(generation: number): Promise<void> {
   }
 
   console.log("Telegram bot started (long polling)");
-  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "none (deny all)" : config.allowedUserIds.join(", ")}`);
+  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);
   if (telegramDebug) console.log("  Debug: enabled");
 
   // Register available skills as bot command menu (non-blocking)
   registerBotCommands(config.token).catch(() => {});
 
-  while (running && pollingGeneration === generation) {
+  while (running) {
     try {
       const data = await callApi<{ ok: boolean; result: TelegramUpdate[] }>(
         config.token,
         "getUpdates",
         { offset, timeout: 30, allowed_updates: ["message", "my_chat_member", "callback_query"] }
       );
-
-      // Check generation after the in-flight long-poll request returns.
-      if (pollingGeneration !== generation) break;
 
       if (!data.ok || !data.result.length) continue;
 
@@ -1803,80 +1095,35 @@ async function poll(generation: number): Promise<void> {
         }
       }
     } catch (err) {
-      if (pollingGeneration !== generation) break;
       if (!running) break;
       console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
       await Bun.sleep(5000);
     }
   }
-
-  if (pollingGeneration === generation) isPolling = false;
 }
 
 // --- Exports ---
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
-export { sendMessage };
+export { sendMessage, sendApprovalMessage };
 
 process.on("SIGTERM", () => { running = false; });
 process.on("SIGINT", () => { running = false; });
 
-async function runPendingResumeTelegram(): Promise<void> {
-  const config = getSettings().telegram;
-  const resume = await loadPendingResume("telegram");
-  if (!resume) return;
-  const chatId = parseInt(resume.channelId, 10);
-  if (!Number.isFinite(chatId)) {
-    console.warn(`[Telegram] Pending resume: invalid chatId "${resume.channelId}"`);
-    return;
-  }
-  console.log(`[Telegram] Running pending resume for chat ${chatId}`);
-  const result = await runUserMessage("telegram", resume.wakeUpPrompt, resume.sessionKey, resume.agentName);
-  if (result.exitCode !== 0) {
-    console.error(`[Telegram] Pending resume failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`);
-    return;
-  }
-  const output = result.stdout?.trim();
-  if (output) {
-    const threadId = resume.threadId ? parseInt(resume.threadId, 10) : undefined;
-    await sendMessage(config.token, chatId, output, Number.isFinite(threadId) ? threadId : undefined);
-  }
-}
-
 /** Start polling in-process (called by start.ts when token is configured) */
 export function startPolling(debug = false): void {
-  if (isPolling) return;
-  running = true;
-  isPolling = true;
   telegramDebug = debug;
-  const gen = ++pollingGeneration;
   (async () => {
     await ensureProjectClaudeMd();
-    await runPendingResumeTelegram().catch((err) =>
-      console.error(`[Telegram] Pending resume failed: ${err instanceof Error ? err.message : err}`)
-    );
-    await poll(gen);
+    await poll();
   })().catch((err) => {
-    if (pollingGeneration === gen) {
-      console.error(`[Telegram] Fatal: ${err}`);
-      isPolling = false;
-    }
+    console.error(`[Telegram] Fatal: ${err}`);
   });
-}
-
-/** Stop polling in-process (called by start.ts when receiveEnabled is toggled off).
- *  Increments the generation token so the in-flight long-poll loop exits as soon
- *  as its current getUpdates call returns, even if running is briefly reset to true
- *  by a concurrent startPolling() call. */
-export function stopPolling(): void {
-  pollingGeneration++;
-  running = false;
-  isPolling = false;
 }
 
 /** Standalone entry point (bun run src/index.ts telegram) */
 export async function telegram() {
   await loadSettings();
   await ensureProjectClaudeMd();
-  await poll(++pollingGeneration);
+  await poll();
 }

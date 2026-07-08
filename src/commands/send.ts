@@ -1,4 +1,4 @@
-import { runUserMessage, ensureProjectClaudeMd } from "../runner";
+import { runUserMessage } from "../runner";
 import { getSession } from "../sessions";
 import { loadSettings, initConfig } from "../config";
 
@@ -14,7 +14,6 @@ export async function send(args: string[]) {
 
   await initConfig();
   await loadSettings();
-  await ensureProjectClaudeMd();
 
   const session = await getSession();
   if (!session) {
