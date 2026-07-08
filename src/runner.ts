@@ -110,6 +110,9 @@ function buildChildEnv(
   const childEnv: Record<string, string> = { ...baseEnv };
   const normalizedModel = config.model.trim().toLowerCase();
 
+  // Strip empty ANTHROPIC_API_KEY so the CLI doesn't see "set but empty" and error out
+  if (childEnv.ANTHROPIC_API_KEY === "") delete childEnv.ANTHROPIC_API_KEY;
+
   if (config.api.trim()) childEnv.ANTHROPIC_AUTH_TOKEN = config.api.trim();
 
   if (config.baseUrl?.trim()) {
