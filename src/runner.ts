@@ -102,13 +102,18 @@ function isNotFoundError(error: unknown): boolean {
   return /enoent|no such file or directory/i.test(message);
 }
 
-function buildChildEnv(baseEnv: Record<string, string>, model: string, api: string): Record<string, string> {
+function buildChildEnv(baseEnv: Record<string, string>, config: ModelConfig): Record<string, string> {
   const childEnv: Record<string, string> = { ...baseEnv };
-  const normalizedModel = model.trim().toLowerCase();
+  const normalizedModel = config.model.trim().toLowerCase();
 
-  if (api.trim()) childEnv.ANTHROPIC_AUTH_TOKEN = api.trim();
+  if (config.api.trim()) childEnv.ANTHROPIC_AUTH_TOKEN = config.api.trim();
 
-  if (normalizedModel === "glm") {
+  if (config.baseUrl?.trim()) {
+    // Custom base URL takes precedence over hardcoded GLM URL
+    childEnv.ANTHROPIC_BASE_URL = config.baseUrl.trim();
+    childEnv.API_TIMEOUT_MS = "3000000";
+  } else if (normalizedModel === "glm") {
+    // Backward-compatible: hardcoded z.ai URL for "glm" sentinel
     childEnv.ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
     childEnv.API_TIMEOUT_MS = "3000000";
   }
@@ -121,19 +126,18 @@ const CLAUDE_TIMEOUT_MS = 5 * 60 * 1000;
 
 async function runClaudeOnce(
   baseArgs: string[],
-  model: string,
-  api: string,
+  config: ModelConfig,
   baseEnv: Record<string, string>,
   timeoutMs: number = CLAUDE_TIMEOUT_MS
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
-  const normalizedModel = model.trim().toLowerCase();
-  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+  const normalizedModel = config.model.trim().toLowerCase();
+  if (config.model.trim() && normalizedModel !== "glm") args.push("--model", config.model.trim());
 
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
-    env: buildChildEnv(baseEnv, model, api),
+    env: buildChildEnv(baseEnv, config),
   });
 
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -296,8 +300,7 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
 /** Run /compact on the current session to reduce context size. */
 export async function runCompact(
   sessionId: string,
-  model: string,
-  api: string,
+  config: ModelConfig,
   baseEnv: Record<string, string>,
   securityArgs: string[],
   timeoutMs: number
@@ -309,7 +312,7 @@ export async function runCompact(
     ...securityArgs,
   ];
   console.log(`[${new Date().toLocaleTimeString()}] Running /compact on session ${sessionId.slice(0, 8)}...`);
-  const result = await runClaudeOnce(compactArgs, model, api, baseEnv, timeoutMs);
+  const result = await runClaudeOnce(compactArgs, config, baseEnv, timeoutMs);
   const success = result.exitCode === 0;
   console.log(`[${new Date().toLocaleTimeString()}] Compact ${success ? "succeeded" : `failed (exit ${result.exitCode})`}`);
   return success;
@@ -329,10 +332,15 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
   const baseEnv = { ...cleanEnv } as Record<string, string>;
   const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
 
+  const compactConfig: ModelConfig = {
+    model: settings.model,
+    api: settings.api,
+    ...(settings.baseUrl ? { baseUrl: settings.baseUrl } : {}),
+  };
+
   const ok = await runCompact(
     existing.sessionId,
-    settings.model,
-    settings.api,
+    compactConfig,
     baseEnv,
     securityArgs,
     timeoutMs
@@ -354,7 +362,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
 
   const settings = getSettings();
-  const { security, model, api, fallback, agentic } = settings;
+  const { security, model, api, baseUrl, fallback, agentic } = settings;
 
   // Determine which model to use based on agentic routing
   let primaryConfig: ModelConfig;
@@ -363,19 +371,28 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
 
   if (agentic.enabled) {
     const routing = selectModel(prompt, agentic.modes, agentic.defaultMode);
-    primaryConfig = { model: routing.model, api };
+    primaryConfig = {
+      model: routing.model,
+      api,
+      ...(baseUrl ? { baseUrl } : {}),
+    };
     taskType = routing.taskType;
     routingReasoning = routing.reasoning;
     console.log(
       `[${new Date().toLocaleTimeString()}] Agentic routing: ${routing.taskType} → ${routing.model} (${routing.reasoning})`
     );
   } else {
-    primaryConfig = { model, api };
+    primaryConfig = {
+      model,
+      api,
+      ...(baseUrl ? { baseUrl } : {}),
+    };
   }
 
   const fallbackConfig: ModelConfig = {
     model: fallback?.model ?? "",
     api: fallback?.api ?? "",
+    ...(fallback?.baseUrl ? { baseUrl: fallback.baseUrl } : {}),
   };
   const securityArgs = buildSecurityArgs(security);
   const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
@@ -421,7 +438,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  let exec = await runClaudeOnce(args, primaryConfig, baseEnv, timeoutMs);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -429,7 +446,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+    exec = await runClaudeOnce(args, fallbackConfig, baseEnv, timeoutMs);
     usedFallback = true;
   }
 
@@ -491,8 +508,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     emitCompactEvent({ type: "auto-compact-start" });
     const compactOk = await runCompact(
       existing.sessionId,
-      primaryConfig.model,
-      primaryConfig.api,
+      primaryConfig,
       baseEnv,
       securityArgs,
       timeoutMs
@@ -501,7 +517,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+      const retryExec = await runClaudeOnce(args, primaryConfig, baseEnv, timeoutMs);
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
@@ -554,7 +570,7 @@ async function streamClaude(
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = await getSession();
-  const { security, model, api } = getSettings();
+  const { security, model, api, baseUrl } = getSettings();
   const securityArgs = buildSecurityArgs(security);
 
   // stream-json gives us events as they happen — text before tool calls,
@@ -584,7 +600,12 @@ async function streamClaude(
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
-  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, model, api);
+  const streamConfig: ModelConfig = {
+    model,
+    api,
+    ...(baseUrl ? { baseUrl } : {}),
+  };
+  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, streamConfig);
 
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 

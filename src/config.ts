@@ -11,9 +11,11 @@ const LOGS_DIR = join(HEARTBEAT_DIR, "logs");
 const DEFAULT_SETTINGS: Settings = {
   model: "",
   api: "",
+  baseUrl: "",
   fallback: {
     model: "",
     api: "",
+    baseUrl: "",
   },
   agentic: {
     enabled: false,
@@ -103,6 +105,7 @@ export interface SecurityConfig {
 export interface Settings {
   model: string;
   api: string;
+  baseUrl?: string;
   fallback: ModelConfig;
   agentic: AgenticConfig;
   timezone: string;
@@ -131,6 +134,7 @@ export interface AgenticConfig {
 export interface ModelConfig {
   model: string;
   api: string;
+  baseUrl?: string;
 }
 
 export interface WebConfig {
@@ -229,9 +233,11 @@ function parseSettings(raw: Record<string, any>): Settings {
   return {
     model: typeof raw.model === "string" ? raw.model.trim() : "",
     api: typeof raw.api === "string" ? raw.api.trim() : "",
+    baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl.trim() : "",
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
       api: typeof raw.fallback?.api === "string" ? raw.fallback.api.trim() : "",
+      baseUrl: typeof raw.fallback?.baseUrl === "string" ? raw.fallback.baseUrl.trim() : "",
     },
     agentic: parseAgenticConfig(raw.agentic),
     timezone: parsedTimezone,
