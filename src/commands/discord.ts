@@ -649,7 +649,9 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
           console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      await sendMessage(config.token, channelId, cleanedText || "(empty response)");
+      if (!cleanedText.trim().startsWith("HEARTBEAT_OK")) {
+        await sendMessage(config.token, channelId, cleanedText || "(empty response)");
+      }
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

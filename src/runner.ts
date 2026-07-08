@@ -102,7 +102,11 @@ function isNotFoundError(error: unknown): boolean {
   return /enoent|no such file or directory/i.test(message);
 }
 
-function buildChildEnv(baseEnv: Record<string, string>, config: ModelConfig): Record<string, string> {
+function buildChildEnv(
+  baseEnv: Record<string, string>,
+  config: ModelConfig,
+  opts: { unattended?: boolean } = {},
+): Record<string, string> {
   const childEnv: Record<string, string> = { ...baseEnv };
   const normalizedModel = config.model.trim().toLowerCase();
 
@@ -118,6 +122,32 @@ function buildChildEnv(baseEnv: Record<string, string>, config: ModelConfig): Re
     childEnv.API_TIMEOUT_MS = "3000000";
   }
 
+  // Approval: signal the PreToolUse hook to gate tool calls for ClaudeClaw spawns.
+  try {
+    const settings = getSettings();
+    if (settings.approval?.enabled && settings.web?.port) {
+      childEnv.CLAUDECLAW_APPROVAL = "1";
+      childEnv.CLAUDECLAW_PORT = String(settings.web.port);
+      if (settings.approval.allowlistPath) {
+        childEnv.CLAUDECLAW_ALLOWLIST = settings.approval.allowlistPath;
+      }
+      if (settings.approval.asklistPath) {
+        childEnv.CLAUDECLAW_ASKLIST = settings.approval.asklistPath;
+      }
+      if (settings.approval.mode === "almost-unrestricted") {
+        childEnv.CLAUDECLAW_MODE = "almost-unrestricted";
+      }
+      if (settings.approval.timeoutMs) {
+        childEnv.CLAUDECLAW_APPROVAL_TIMEOUT_MS = String(settings.approval.timeoutMs);
+      }
+      if (opts.unattended && settings.approval.unattendedDeny) {
+        childEnv.CLAUDECLAW_UNATTENDED = "1";
+      }
+    }
+  } catch {
+    // getSettings() not initialized — skip approval injection
+  }
+
   return childEnv;
 }
 
@@ -128,7 +158,8 @@ async function runClaudeOnce(
   baseArgs: string[],
   config: ModelConfig,
   baseEnv: Record<string, string>,
-  timeoutMs: number = CLAUDE_TIMEOUT_MS
+  timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  opts: { unattended?: boolean } = {}
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = config.model.trim().toLowerCase();
@@ -137,7 +168,7 @@ async function runClaudeOnce(
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
-    env: buildChildEnv(baseEnv, config),
+    env: buildChildEnv(baseEnv, config, opts),
   });
 
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -351,7 +382,7 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, threadId?: string, unattended: boolean = true): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -438,7 +469,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig, baseEnv, timeoutMs);
+  let exec = await runClaudeOnce(args, primaryConfig, baseEnv, timeoutMs, { unattended });
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -446,7 +477,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig, baseEnv, timeoutMs);
+    exec = await runClaudeOnce(args, fallbackConfig, baseEnv, timeoutMs, { unattended });
     usedFallback = true;
   }
 
@@ -517,7 +548,7 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeOnce(args, primaryConfig, baseEnv, timeoutMs);
+      const retryExec = await runClaudeOnce(args, primaryConfig, baseEnv, timeoutMs, { unattended });
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
@@ -557,8 +588,8 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId), threadId);
+export async function run(name: string, prompt: string, threadId?: string, unattended: boolean = true): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, unattended), threadId);
 }
 
 async function streamClaude(
@@ -605,7 +636,8 @@ async function streamClaude(
     api,
     ...(baseUrl ? { baseUrl } : {}),
   };
-  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, streamConfig);
+  // streamClaude is only called from streamUserMessage (web chat / Telegram) — always interactive.
+  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, streamConfig, { unattended: false });
 
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 
@@ -709,7 +741,8 @@ function prefixUserMessageWithClock(prompt: string): string {
 }
 
 export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId);
+  // Messages from Telegram/Discord/chat always have a user at the other end — interactive.
+  return run(name, prefixUserMessageWithClock(prompt), threadId, false);
 }
 
 /**

@@ -149,6 +149,58 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         return json(await readLogs(tail));
       }
 
+      if (url.pathname === "/api/approval/request" && req.method === "POST") {
+        if (!opts.onApprovalRequest) {
+          return json({ ok: false, error: "approval not configured" }, { status: 503 });
+        }
+        try {
+          const body = await req.json();
+          const toolName = typeof body?.toolName === "string" ? body.toolName.trim() : "";
+          if (!toolName) return json({ ok: false, error: "toolName required" }, { status: 400 });
+          const description = typeof body?.description === "string" ? body.description : undefined;
+          const request = await opts.onApprovalRequest(toolName, body?.toolInput, description);
+          return json({ ok: true, request });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname.startsWith("/api/approval/result/") && req.method === "GET") {
+        if (!opts.onApprovalAwait) {
+          return json({ ok: false, error: "approval not configured" }, { status: 503 });
+        }
+        const id = decodeURIComponent(url.pathname.slice("/api/approval/result/".length));
+        if (!id) return json({ ok: false, error: "id required" }, { status: 400 });
+        const waitMs = clampInt(url.searchParams.get("waitMs"), 30000, 0, 300000);
+        try {
+          const outcome = await opts.onApprovalAwait(id, waitMs);
+          return json({ ok: true, ...outcome });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, { status: 500 });
+        }
+      }
+
+      if (url.pathname.startsWith("/api/approval/resolve/") && req.method === "POST") {
+        if (!opts.onApprovalResolve) {
+          return json({ ok: false, error: "approval not configured" }, { status: 503 });
+        }
+        const id = decodeURIComponent(url.pathname.slice("/api/approval/resolve/".length));
+        if (!id) return json({ ok: false, error: "id required" }, { status: 400 });
+        try {
+          const body = await req.json();
+          const decision = body?.decision;
+          if (decision !== "approve" && decision !== "approve_always" && decision !== "deny") {
+            return json({ ok: false, error: "decision must be approve|approve_always|deny" }, { status: 400 });
+          }
+          const pattern = typeof body?.pattern === "string" ? body.pattern : undefined;
+          const reason = typeof body?.reason === "string" ? body.reason : undefined;
+          const resolved = await opts.onApprovalResolve(id, { decision, pattern, reason });
+          return json({ ok: resolved, resolved });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, { status: 500 });
+        }
+      }
+
       if (url.pathname === "/api/chat" && req.method === "POST") {
         if (!opts.onChat) return json({ ok: false, error: "chat not configured" });
         try {

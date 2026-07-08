@@ -298,17 +298,27 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
   return (await res.json()) as T;
 }
 
-async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
+async function sendMessage(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+  replyMarkup?: Record<string, unknown>,
+): Promise<void> {
   const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
   const html = markdownToTelegramHtml(normalized);
   const MAX_LEN = 4096;
-  for (let i = 0; i < html.length; i += MAX_LEN) {
+  // Attach reply_markup only to the final chunk so the buttons render under the last message
+  const totalChunks = Math.max(1, Math.ceil(html.length / MAX_LEN));
+  for (let idx = 0, i = 0; i < html.length; i += MAX_LEN, idx++) {
+    const isLast = idx === totalChunks - 1;
     try {
       await callApi(token, "sendMessage", {
         chat_id: chatId,
         text: html.slice(i, i + MAX_LEN),
         parse_mode: "HTML",
         ...(threadId ? { message_thread_id: threadId } : {}),
+        ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
     } catch {
       // Fallback to plain text if HTML parsing fails
@@ -316,9 +326,31 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
         chat_id: chatId,
         text: normalized.slice(i, i + MAX_LEN),
         ...(threadId ? { message_thread_id: threadId } : {}),
+        ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
     }
   }
+}
+
+async function sendApprovalMessage(
+  token: string,
+  chatId: number,
+  request: { id: string; toolName: string; description: string },
+): Promise<void> {
+  const text = [
+    "🔐 **Approval requested**",
+    "",
+    `**Tool:** ${request.toolName}`,
+    `**Action:** \`${request.description}\``,
+  ].join("\n");
+  const keyboard = {
+    inline_keyboard: [[
+      { text: "✅ Approve", callback_data: `apr_yes_${request.id}` },
+      { text: "❌ Deny", callback_data: `apr_no_${request.id}` },
+      { text: "♾️ Always", callback_data: `apr_always_${request.id}` },
+    ]],
+  };
+  await sendMessage(token, chatId, text, undefined, keyboard);
 }
 
 async function sendTyping(token: string, chatId: number, threadId?: number): Promise<void> {
@@ -844,7 +876,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      if (cleanedText) {
+      if (cleanedText && !cleanedText.trim().startsWith("HEARTBEAT_OK")) {
         await sendMessage(config.token, chatId, cleanedText, threadId);
       }
       for (const fp of filePaths) {
@@ -895,6 +927,56 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
       }
     } catch {
       // server not running or error
+    }
+    await callApi(config.token, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: answerText,
+    }).catch(() => {});
+    return;
+  }
+
+  // Approval pattern: "apr_(yes|no|always)_<uuid>" routed to ClaudeClaw's own /api/approval/resolve
+  const aprMatch = data.match(/^apr_(yes|no|always)_([0-9a-f-]{36})$/);
+  if (aprMatch) {
+    const action = aprMatch[1];
+    const approvalId = aprMatch[2];
+    const decision =
+      action === "yes" ? "approve" :
+      action === "always" ? "approve_always" :
+      "deny";
+    const webPort = getSettings().web.port;
+    let answerText = "⚠️ Server error";
+    let statusLine = "";
+    try {
+      const resp = await fetch(`http://127.0.0.1:${webPort}/api/approval/resolve/${approvalId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          decision,
+          reason: action === "no" ? "Denied from Telegram" : undefined,
+        }),
+      });
+      const result = await resp.json() as { ok?: boolean; resolved?: boolean };
+      if (result.resolved) {
+        answerText = decision === "deny" ? "❌ Denied" : decision === "approve_always" ? "♾️ Always" : "✅ Approved";
+        statusLine = `\n\n${answerText}`;
+      } else {
+        answerText = "⚠️ Already resolved or expired";
+        statusLine = "\n\n⚠️ Already settled";
+      }
+      if (query.message) {
+        const baseText = query.message.text ?? "";
+        const newText = baseText.replace(/\n\n(✅|❌|♾️|⚠️).*$/s, "") + statusLine;
+        await callApi(config.token, "editMessageText", {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          text: newText,
+          // Clear the inline keyboard now that the decision is made
+          reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+      }
+    } catch {
+      // web server unreachable
     }
     await callApi(config.token, "answerCallbackQuery", {
       callback_query_id: query.id,
@@ -1023,7 +1105,7 @@ async function poll(): Promise<void> {
 // --- Exports ---
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
-export { sendMessage };
+export { sendMessage, sendApprovalMessage };
 
 process.on("SIGTERM", () => { running = false; });
 process.on("SIGINT", () => { running = false; });

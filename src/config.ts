@@ -63,6 +63,14 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  approval: {
+    enabled: false,
+    mode: "allowlist",
+    timeoutMs: 300000,
+    unattendedDeny: true,
+    allowlistPath: ".claude/claudeclaw/allowlist.json",
+    asklistPath: "",
+  },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -102,6 +110,30 @@ export interface SecurityConfig {
   disallowedTools: string[];
 }
 
+export type ApprovalMode = "allowlist" | "almost-unrestricted";
+
+export interface ApprovalConfig {
+  /** When true, daemon constructs the approval queue and sets env vars on spawned sessions so the PreToolUse hook gates tool calls. */
+  enabled: boolean;
+  /**
+   * The posture taken for tool calls that match neither list.
+   *  - "allowlist" (default, conservative): unmatched calls prompt for approval.
+   *    Pair with an allowlist of safe patterns to keep routine work silent.
+   *  - "almost-unrestricted": unmatched calls silently pass. Pair with an asklist
+   *    to gate the few sensitive things you still want to confirm.
+   * Asklist matches always prompt, regardless of mode.
+   */
+  mode: ApprovalMode;
+  /** How long a pending approval can wait before auto-deny (milliseconds). */
+  timeoutMs: number;
+  /** For unattended contexts (cron, heartbeat): auto-deny anything that would have prompted (not on the allowlist, or matched the asklist). */
+  unattendedDeny: boolean;
+  /** Path to the allowlist JSON file (silent-approve patterns), resolved relative to project cwd when not absolute. */
+  allowlistPath: string;
+  /** Optional path to the asklist JSON file (always-prompt patterns). Asklist matches trump the allowlist and the mode default. Empty string disables. */
+  asklistPath: string;
+}
+
 export interface Settings {
   model: string;
   api: string;
@@ -116,6 +148,8 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  approval: ApprovalConfig;
+  sessionTimeoutMs?: number;
 }
 
 export interface AgenticMode {
@@ -280,6 +314,28 @@ function parseSettings(raw: Record<string, any>): Settings {
       baseUrl: typeof raw.stt?.baseUrl === "string" ? raw.stt.baseUrl.trim() : "",
       model: typeof raw.stt?.model === "string" ? raw.stt.model.trim() : "",
     },
+    approval: parseApprovalConfig(raw.approval),
+    sessionTimeoutMs: typeof raw.sessionTimeoutMs === "number" ? raw.sessionTimeoutMs : undefined,
+  };
+}
+
+function parseApprovalConfig(raw: any): ApprovalConfig {
+  const defaults = DEFAULT_SETTINGS.approval;
+  if (!raw || typeof raw !== "object") return { ...defaults };
+  const timeoutMs = Number(raw.timeoutMs);
+  const allowlist = typeof raw.allowlistPath === "string" && raw.allowlistPath.trim()
+    ? raw.allowlistPath.trim()
+    : defaults.allowlistPath;
+  const asklist = typeof raw.asklistPath === "string" ? raw.asklistPath.trim() : defaults.asklistPath;
+  const mode: ApprovalMode =
+    raw.mode === "almost-unrestricted" ? "almost-unrestricted" : "allowlist";
+  return {
+    enabled: Boolean(raw.enabled ?? defaults.enabled),
+    mode,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : defaults.timeoutMs,
+    unattendedDeny: typeof raw.unattendedDeny === "boolean" ? raw.unattendedDeny : defaults.unattendedDeny,
+    allowlistPath: allowlist,
+    asklistPath: asklist,
   };
 }
 

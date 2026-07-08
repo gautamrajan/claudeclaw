@@ -9,6 +9,7 @@ import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
+import { ApprovalQueue } from "../approvals";
 import type { Job } from "../jobs";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
@@ -349,6 +350,32 @@ export async function start(args: string[] = []) {
   let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   const daemonStartedAt = Date.now();
 
+  // --- Approval queue ---
+  // onCreate fires when a PreToolUse hook POSTs /api/approval/request. We notify
+  // the first allowed Telegram user with inline buttons. The button tap routes
+  // back via callback_query -> handleCallbackQuery -> POST /api/approval/resolve.
+  const approvalQueue: ApprovalQueue | null = currentSettings.approval.enabled
+    ? new ApprovalQueue({
+        onCreate: async (request) => {
+          const chatIds = currentSettings.telegram.allowedUserIds;
+          const token = currentSettings.telegram.token;
+          if (!token || chatIds.length === 0) {
+            console.warn(`[approval] ${request.id} created but Telegram not configured; approval will time out`);
+            return;
+          }
+          try {
+            const { sendApprovalMessage } = await import("./telegram");
+            await sendApprovalMessage(token, chatIds[0], request);
+          } catch (err) {
+            console.error(`[approval] failed to send Telegram prompt for ${request.id}:`, err);
+          }
+        },
+      })
+    : null;
+  if (approvalQueue) {
+    console.log(`  Approval: enabled (timeout ${Math.round(currentSettings.approval.timeoutMs / 1000)}s)`);
+  }
+
   // --- Telegram ---
   let telegramSend: ((chatId: number, text: string) => Promise<void>) | null = null;
   let telegramToken = "";
@@ -417,6 +444,7 @@ export async function start(args: string[] = []) {
             heartbeatNextAt: nextHeartbeatAt,
             settings: currentSettings,
             jobs: currentJobs,
+            pendingApprovals: approvalQueue?.getPending() ?? [],
           }),
           onHeartbeatEnabledChanged: (enabled) => {
             if (currentSettings.heartbeat.enabled === enabled) return;
@@ -464,6 +492,16 @@ export async function start(args: string[] = []) {
           onChat: async (message, onChunk, onUnblock) => {
             await streamUserMessage("chat", message, onChunk, onUnblock);
           },
+          onApprovalRequest: approvalQueue
+            ? (toolName, toolInput, description) =>
+                approvalQueue.create(toolName, toolInput, description)
+            : undefined,
+          onApprovalAwait: approvalQueue
+            ? (id, waitMs) => approvalQueue.awaitResult(id, waitMs)
+            : undefined,
+          onApprovalResolve: approvalQueue
+            ? async (id, result) => approvalQueue.resolve(id, result)
+            : undefined,
         });
       } catch (err) {
         lastError = err;
@@ -701,6 +739,7 @@ export async function start(args: string[] = []) {
           .then((r) => {
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
+            if (r.stdout.trim().startsWith("HEARTBEAT_OK")) return;
             forwardToTelegram(job.name, r);
             forwardToDiscord(job.name, r);
           })
