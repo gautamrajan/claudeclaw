@@ -113,7 +113,7 @@ function buildChildEnv(
   // Strip empty ANTHROPIC_API_KEY so the CLI doesn't see "set but empty" and error out
   if (childEnv.ANTHROPIC_API_KEY === "") delete childEnv.ANTHROPIC_API_KEY;
 
-  if (config.api.trim()) childEnv.ANTHROPIC_AUTH_TOKEN = config.api.trim();
+  if (config.api.trim()) childEnv.ANTHROPIC_API_KEY = config.api.trim();
 
   if (config.baseUrl?.trim()) {
     // Custom base URL takes precedence over hardcoded GLM URL
