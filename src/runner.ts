@@ -116,6 +116,10 @@ function buildChildEnv(
     // Custom base URL takes precedence over hardcoded GLM URL
     childEnv.ANTHROPIC_BASE_URL = config.baseUrl.trim();
     childEnv.API_TIMEOUT_MS = "3000000";
+    // Set model via env vars instead of --model flag to bypass CLI validation
+    childEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = config.model.trim();
+    childEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = config.model.trim();
+    childEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = config.model.trim();
   } else if (normalizedModel === "glm") {
     // Backward-compatible: hardcoded z.ai URL for "glm" sentinel
     childEnv.ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
@@ -163,7 +167,9 @@ async function runClaudeOnce(
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = config.model.trim().toLowerCase();
-  if (config.model.trim() && normalizedModel !== "glm") args.push("--model", config.model.trim());
+  // Skip --model when baseUrl is set (model is set via env vars instead)
+  // to avoid the Claude CLI validating the model name against its own registry
+  if (config.model.trim() && normalizedModel !== "glm" && !config.baseUrl) args.push("--model", config.model.trim());
 
   const proc = Bun.spawn(args, {
     stdout: "pipe",
@@ -628,7 +634,8 @@ async function streamClaude(
   }
 
   const normalizedModel = model.trim().toLowerCase();
-  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+  // Skip --model when baseUrl is set (model is set via env vars instead)
+  if (model.trim() && normalizedModel !== "glm" && !baseUrl) args.push("--model", model.trim());
 
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const streamConfig: ModelConfig = {
